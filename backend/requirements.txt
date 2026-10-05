@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+psycopg[binary]
+pydantic
+pydantic-settings
+python-dotenv
+python-multipart
+rasterio
+mercantile
+pyogrio
+osmium

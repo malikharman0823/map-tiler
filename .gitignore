@@ -1,0 +1,23 @@
+# Dependencies
+node_modules/
+backend/.venv/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+!frontend/.env.example
+
+# Build and generated output
+dist/
+frontend/dist/
+frontend/.vite-build-check/
+frontend/.playwright-cli/
+generated/
+!generated/.gitkeep
+
+# Runtime uploads and caches
+backend/storage/uploads/
+.npm-cache/
+__pycache__/
+*.py[cod]

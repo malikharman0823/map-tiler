@@ -1,0 +1,45 @@
+generator client {
+  provider = "prisma-client"
+  output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model Dataset {
+  id                 String         @id @default(uuid()) @db.Uuid
+  filename           String         @db.Text
+  fileSize           BigInt         @map("file_size")
+  contentType        String?        @map("content_type") @db.Text
+  fileHash           String         @unique @map("file_hash") @db.Text
+  storagePath        String         @map("storage_path") @db.Text
+  metadata           Json           @db.JsonB
+  georeferencedPath  String?        @map("georeferenced_path") @db.Text
+  georeferenceStatus String         @default("not_started") @map("georeference_status") @db.Text
+  processedPath      String?        @map("processed_path") @db.Text
+  processStatus      String         @default("not_started") @map("process_status") @db.Text
+  tilePath           String?        @map("tile_path") @db.Text
+  tileMinZoom        Int?           @map("tile_min_zoom")
+  tileMaxZoom        Int?           @map("tile_max_zoom")
+  tileStatus         String         @default("not_started") @map("tile_status") @db.Text
+  createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
+  controlPoints      ControlPoint[]
+
+  @@map("datasets")
+}
+
+model ControlPoint {
+  id        String   @id @default(uuid()) @db.Uuid
+  datasetId String   @map("dataset_id") @db.Uuid
+  imageX    Float    @map("image_x")
+  imageY    Float    @map("image_y")
+  longitude Float
+  latitude  Float
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt DateTime @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  dataset   Dataset  @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+
+  @@index([datasetId])
+  @@map("control_points")
+}
