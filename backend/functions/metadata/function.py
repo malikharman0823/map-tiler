@@ -1,4 +1,5 @@
 import logging
+import math
 from pathlib import Path
 from typing import Any, BinaryIO
 import xml.etree.ElementTree as ElementTree
@@ -13,6 +14,13 @@ from starlette.concurrency import run_in_threadpool
 from functions.metadata.request import MetadataRequest
 from functions.metadata.response import MetadataData, MetadataResponse
 from functions.pbf_preview.function import parse_pbf_with_preview
+from functions.formats.function import (
+    classify_json_document,
+    geojson_metadata,
+    inspect_geopackage,
+    mbtiles_metadata,
+    read_json_document,
+)
 from schemas.error import ApplicationError
 
 
@@ -47,6 +55,50 @@ def _bounds(
     }
 
 
+def _finite_number(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _raster_colormap_legend(dataset: Any) -> dict[str, Any] | None:
+    if dataset.count != 1:
+        return None
+    try:
+        color_map = dataset.colormap(1)
+    except (RasterioIOError, ValueError):
+        return None
+    if not color_map:
+        return None
+
+    items: list[dict[str, Any]] = []
+    for value, rgba in sorted(color_map.items()):
+        if not isinstance(rgba, tuple) or len(rgba) != 4:
+            continue
+        red, green, blue, alpha = rgba
+        if not all(isinstance(channel, int) and 0 <= channel <= 255 for channel in rgba):
+            continue
+        items.append(
+            {
+                "type": "raster",
+                "label": f"Value {value}",
+                "value": int(value),
+                "color": f"#{red:02X}{green:02X}{blue:02X}",
+                "opacity": round(alpha / 255, 4),
+            }
+        )
+
+    if not items:
+        return None
+    return {
+        "title": "Source color table",
+        "source": "raster_colormap",
+        "items": items,
+    }
+
+
 def _extract_raster_metadata(file_path: Path) -> dict[str, Any]:
     try:
         with rasterio.open(file_path) as dataset:
@@ -64,6 +116,10 @@ def _extract_raster_metadata(file_path: Path) -> dict[str, Any]:
                 ),
                 "crs": dataset.crs.to_string() if dataset.crs else None,
                 "bounds": None,
+                "nodata": _finite_number(dataset.nodata),
+                "color_interpretation": [
+                    interpretation.name for interpretation in dataset.colorinterp
+                ],
             }
 
             transform = dataset.transform
@@ -82,6 +138,10 @@ def _extract_raster_metadata(file_path: Path) -> dict[str, Any]:
                     float(transform.e),
                     float(transform.f),
                 ]
+
+            color_map_legend = _raster_colormap_legend(dataset)
+            if color_map_legend is not None:
+                metadata["legend"] = color_map_legend
 
             return metadata
     except (RasterioIOError, OSError, ValueError) as exc:
@@ -338,8 +398,34 @@ def _extract_metadata(request: MetadataRequest) -> MetadataResponse:
         )
 
     normalized_format = request.format.lower()
+    detected_format = normalized_format
+    detected_category = request.category
     if normalized_format in RASTER_FORMATS:
         metadata = _extract_raster_metadata(file_path)
+    elif normalized_format in {"geojson", "json"}:
+        document = read_json_document(file_path)
+        detected_format = classify_json_document(
+            document,
+            require_geojson=normalized_format == "geojson",
+        )
+        if detected_format == "geojson":
+            detected_category = "vector"
+            metadata = geojson_metadata(document, file_path.stat().st_size)
+        else:
+            detected_category = "style"
+            metadata = {
+                "file_size": file_path.stat().st_size,
+                "style_version": 8,
+                "source_count": len(document["sources"]),
+                "layer_count": len(document["layers"]),
+                "style": document,
+                "crs": "EPSG:3857",
+                "bounds": None,
+            }
+    elif normalized_format == "geopackage":
+        metadata = inspect_geopackage(file_path)
+    elif normalized_format == "mbtiles":
+        metadata = mbtiles_metadata(file_path)
     elif normalized_format in KML_FORMATS:
         metadata = _extract_kml_metadata(file_path, normalized_format)
     elif normalized_format == "shapefile":
@@ -357,8 +443,8 @@ def _extract_metadata(request: MetadataRequest) -> MetadataResponse:
 
     return MetadataResponse(
         data=MetadataData(
-            format=normalized_format,
-            category=request.category,
+            format=detected_format,
+            category=detected_category,
             metadata=metadata,
         )
     )

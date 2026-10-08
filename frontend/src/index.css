@@ -1,4 +1,9 @@
 @import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource-variable/geist";
+
+@custom-variant dark (&:is(.dark *));
 @config "../tailwind.config.js";
 
 :root {
@@ -7,6 +12,38 @@
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.841 0.238 128.85);
+  --primary-foreground: oklch(0.405 0.101 131.063);
+  --secondary: oklch(0.967 0.001 286.375);
+  --secondary-foreground: oklch(0.21 0.006 285.885);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --chart-1: oklch(0.897 0.196 126.665);
+  --chart-2: oklch(0.768 0.233 130.85);
+  --chart-3: oklch(0.648 0.2 131.684);
+  --chart-4: oklch(0.532 0.157 131.589);
+  --chart-5: oklch(0.453 0.124 130.933);
+  --radius: 0.625rem;
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.648 0.2 131.684);
+  --sidebar-primary-foreground: oklch(0.986 0.031 120.757);
+  --sidebar-accent: oklch(0.97 0 0);
+  --sidebar-accent-foreground: oklch(0.205 0 0);
+  --sidebar-border: oklch(0.922 0 0);
+  --sidebar-ring: oklch(0.708 0 0);
 }
 
 * {
@@ -63,7 +100,7 @@ button:active,
   }
 
   .error-panel {
-    @apply rounded-lg border border-hairline bg-white p-6 text-left;
+    @apply rounded-lg border border-border bg-card p-6 text-left;
   }
 }
 
@@ -88,7 +125,244 @@ button:active,
 }
 
 input[type="range"] {
-  accent-color: #0066cc;
+  accent-color: #16a34a;
+}
+
+.dataset-control-point-marker {
+  position: relative;
+  display: grid;
+  min-width: 44px;
+  min-height: 48px;
+  place-items: end center;
+  padding: 0 0 3px;
+  border: 0;
+  background: transparent;
+  color: #16a34a;
+  cursor: pointer;
+}
+
+.dataset-control-point-marker::after {
+  position: absolute;
+  bottom: 4px;
+  left: 50%;
+  width: 2px;
+  height: 16px;
+  content: "";
+  background: currentColor;
+  transform: translateX(-50%);
+}
+
+.dataset-control-point-marker__label {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  z-index: 1;
+  min-height: 24px;
+  padding: 4px 7px;
+  border: 1px solid #d7d7d7;
+  border-radius: 7px;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12);
+  color: #1d1d1f;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 14px;
+  white-space: nowrap;
+  transform: translateX(-50%);
+}
+
+.dataset-control-point-marker__dot {
+  position: relative;
+  z-index: 1;
+  display: block;
+  width: 14px;
+  height: 14px;
+  border: 3px solid #fff;
+  border-radius: 9999px;
+  background: currentColor;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.18);
+}
+
+.dataset-control-point-marker.is-selected {
+  color: #15803d;
+}
+
+.dataset-control-point-marker.is-selected .dataset-control-point-marker__label {
+  border-color: #16a34a;
+  box-shadow: 0 0 0 3px rgba(22, 163, 74, 0.16);
+}
+
+.maplibregl-popup:has(.dataset-map-popup) .maplibregl-popup-content {
+  min-width: 210px;
+  padding: 13px 14px;
+  border-radius: 12px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, 0.16);
+}
+
+.dataset-map-popup strong {
+  display: block;
+  margin: 0 24px 8px 0;
+  color: #1d1d1f;
+  font-size: 13px;
+}
+
+.dataset-map-popup p {
+  margin: 0 0 8px;
+  color: #1d1d1f;
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.dataset-map-popup div {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 12px;
+  color: #7a7a7a;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.dataset-map-popup div span:last-child {
+  color: #1d1d1f;
+  font-variant-numeric: tabular-nums;
+}
+
+.map-coordinates {
+  position: absolute;
+  z-index: 8;
+  right: 12px;
+  bottom: 12px;
+  display: flex;
+  gap: 14px;
+  padding: 8px 11px;
+  border: 1px solid #e0e0e0;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.94);
+  color: #1d1d1f;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  pointer-events: none;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.08);
+}
+
+.control-point-marker {
+  position: absolute;
+  z-index: 3;
+  width: 42px;
+  height: 42px;
+  padding: 0;
+  border: 0;
+  border-radius: 9999px;
+  background: transparent;
+  color: #16a34a;
+  cursor: grab;
+  transform: translate(-50%, -50%);
+  touch-action: none;
+}
+
+.control-point-marker:active {
+  cursor: grabbing;
+}
+
+.control-point-marker__hair::before,
+.control-point-marker__hair::after {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  display: block;
+  content: "";
+  background: currentColor;
+  transform: translate(-50%, -50%);
+}
+
+.control-point-marker__hair::before {
+  width: 42px;
+  height: 2px;
+}
+
+.control-point-marker__hair::after {
+  width: 2px;
+  height: 42px;
+}
+
+.control-point-marker__hair {
+  position: absolute;
+  inset: 0;
+  display: block;
+  border: 3px solid currentColor;
+  border-radius: 9999px;
+  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.9);
+}
+
+.control-point-marker__label {
+  position: absolute;
+  z-index: 1;
+  top: -10px;
+  right: -11px;
+  display: grid;
+  width: 25px;
+  height: 25px;
+  place-items: center;
+  border: 1px solid #d7d7d7;
+  border-radius: 9999px;
+  background: #fff;
+  color: #1d1d1f;
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.control-point-marker.is-selected {
+  color: #004c99;
+}
+
+.control-point-marker.is-selected .control-point-marker__hair {
+  box-shadow: 0 0 0 5px rgba(0, 102, 204, 0.18);
+}
+
+.control-point-marker.is-draft {
+  pointer-events: none;
+  color: #b67a00;
+}
+
+.map-control-marker {
+  position: relative;
+}
+
+.source-control-marker {
+  position: absolute;
+}
+
+.geo-canvas-control {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  place-items: center;
+  border: 0;
+  background: #fff;
+  color: #1d1d1f;
+  font-size: 24px;
+  line-height: 1;
+}
+
+.geo-canvas-control:hover,
+.geo-action-button:hover:not(:disabled) {
+  background: #f5f5f7;
+}
+
+.geo-action-button {
+  min-height: 44px;
+  border: 1px solid #e0e0e0;
+  border-radius: 9999px;
+  background: #fff;
+  color: #1d1d1f;
+  font-size: 13px;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+
+.geo-action-button:disabled {
+  cursor: not-allowed;
+  color: #a0a0a0;
 }
 
 @media (max-width: 640px) {
@@ -105,5 +379,94 @@ input[type="range"] {
     transition-duration: 0.01ms !important;
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+  }
+}
+
+@theme inline {
+  --font-heading: var(--font-sans);
+  --font-sans: 'Geist Variable', sans-serif;
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+.dark {
+  --background: #1f1f1f;
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.768 0.233 130.85);
+  --primary-foreground: oklch(0.405 0.101 131.063);
+  --secondary: oklch(0.274 0.006 286.033);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+  --chart-1: oklch(0.897 0.196 126.665);
+  --chart-2: oklch(0.768 0.233 130.85);
+  --chart-3: oklch(0.648 0.2 131.684);
+  --chart-4: oklch(0.532 0.157 131.589);
+  --chart-5: oklch(0.453 0.124 130.933);
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.768 0.233 130.85);
+  --sidebar-primary-foreground: oklch(0.274 0.072 132.109);
+  --sidebar-accent: oklch(0.269 0 0);
+  --sidebar-accent-foreground: oklch(0.985 0 0);
+  --sidebar-border: oklch(1 0 0 / 10%);
+  --sidebar-ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
   }
 }

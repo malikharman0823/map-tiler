@@ -1,21 +1,7 @@
 import React, { useRef, useState } from "react"
 
 export const ACCEPTED_FORMATS =
-  ".jpg,.jpeg,.png,.tif,.tiff,.kml,.kmz,.shp,.shx,.dbf,.prj,.cpg,.osm,.pbf,.osm.pbf"
-
-function UploadIcon() {
-  return (
-    <svg
-      aria-hidden="true"
-      viewBox="0 0 48 48"
-      className="h-16 w-16 fill-none stroke-[#7a7a7a]"
-      strokeWidth="1.7"
-    >
-      <path d="M13 4h15l8 8v29a3 3 0 0 1-3 3H13a3 3 0 0 1-3-3V7a3 3 0 0 1 3-3Z" strokeLinejoin="round" />
-      <path d="M28 4v9h8M24 34V20m0 0-6 6m6-6 6 6" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
-  )
-}
+  ".mtmap,.gpkg,.geojson,.tif,.tiff,.mbtiles,.json,.jpg,.jpeg,.png,.kml,.kmz,.shp,.shx,.dbf,.prj,.cpg,.osm,.pbf,.osm.pbf"
 
 export default function UploadBox({ disabled, onSelect }) {
   const inputRef = useRef(null)
@@ -38,9 +24,10 @@ export default function UploadBox({ disabled, onSelect }) {
 
   return (
     <div
-      className={`flex min-h-[360px] flex-col items-center justify-center rounded-utility border bg-white px-6 py-12 text-center transition-colors ${
-        dragging ? "border-primary" : "border-hairline"
-      }`}
+      onClick={!disabled ? chooseFile : undefined}
+      className={`relative group bg-white border-2 border-dashed transition-all rounded-lg p-10 flex flex-col items-center justify-center text-center cursor-pointer ${
+        dragging ? "border-[#a0a0a0] bg-pearl" : "border-[#d0d0d0] hover:border-[#a0a0a0]"
+      } ${disabled ? "opacity-50 cursor-not-allowed" : ""}`}
       onDragEnter={(event) => {
         event.preventDefault()
         if (!disabled) setDragging(true)
@@ -51,19 +38,25 @@ export default function UploadBox({ disabled, onSelect }) {
       }}
       onDrop={handleDrop}
     >
-      <UploadIcon />
-      <h2 className="mt-6 text-[28px] font-semibold leading-[1.14] text-ink">
-        Choose a file
-      </h2>
-      <p className="mt-1 text-[17px] text-muted">or drop it here</p>
-      <button
-        type="button"
-        className="primary-button mt-8 min-w-44"
-        onClick={chooseFile}
-        disabled={disabled}
-      >
-        Choose file
-      </button>
+      <div className="w-12 h-12 rounded-lg bg-[#f8f9fa] border border-hairline flex items-center justify-center text-muted mb-4 group-hover:text-ink group-hover:border-[#c0c0c0] transition-colors">
+        <span className="material-symbols-outlined text-[24px]">cloud_upload</span>
+      </div>
+      <h3 className="text-sm font-medium text-ink mb-1">
+        Drag and drop files here or click to browse
+      </h3>
+      <p className="text-xs text-muted max-w-sm mb-5">
+        Supports Full MapProjects (.mtmap), GeoPackage, GeoJSON, GeoTIFF, MBTiles, MapLibre style JSON, and legacy raster/vector formats.
+      </p>
+      <div className="flex items-center gap-2">
+        <button
+          type="button"
+          disabled={disabled}
+          className="inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-md bg-ink hover:bg-[#202020] text-xs font-medium text-white transition-colors"
+        >
+          <span className="material-symbols-outlined text-[15px]">folder_open</span>
+          <span>Browse local files</span>
+        </button>
+      </div>
       <input
         ref={inputRef}
         className="sr-only"

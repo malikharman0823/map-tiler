@@ -252,22 +252,54 @@ def _read_tile(source, tile_bounds) -> numpy.ndarray:
         )
 
     color_indexes = [1] if source.count < 3 else [1, 2, 3]
-    window = source.window(
+    from rasterio.transform import from_bounds
+    from rasterio.vrt import WarpedVRT
+    
+    dst_transform = from_bounds(
         tile_bounds.left,
         tile_bounds.bottom,
         tile_bounds.right,
         tile_bounds.top,
+        TILE_SIZE,
+        TILE_SIZE
     )
+    
     try:
-        colors = source.read(
-            color_indexes,
-            window=window,
-            out_shape=(len(color_indexes), TILE_SIZE, TILE_SIZE),
-            boundless=True,
-            masked=True,
-            fill_value=0,
+        with WarpedVRT(
+            source,
+            crs=source.crs,
+            transform=dst_transform,
+            width=TILE_SIZE,
+            height=TILE_SIZE,
             resampling=Resampling.bilinear,
-        )
+        ) as vrt:
+            colors = vrt.read(
+                color_indexes,
+                masked=True,
+            )
+            color_mask = numpy.ma.getmaskarray(colors)
+            valid_pixels = ~numpy.any(color_mask, axis=0)
+            color_values = _to_uint8(numpy.asarray(colors.filled(0)))
+            if len(color_indexes) == 1:
+                red = green = blue = color_values[0]
+            else:
+                red, green, blue = color_values
+        
+            alpha = numpy.where(valid_pixels, 255, 0).astype(numpy.uint8)
+            has_alpha_band = (
+                source.count in {2, 4}
+                and source.colorinterp[source.count - 1] == ColorInterp.alpha
+            )
+            if has_alpha_band:
+                source_alpha = vrt.read(
+                    source.count,
+                    masked=True,
+                )
+                alpha_values = _to_uint8(numpy.asarray(source_alpha.filled(0)))
+                alpha_mask = numpy.ma.getmaskarray(source_alpha)
+                alpha = numpy.where(valid_pixels & ~alpha_mask, alpha_values, 0).astype(
+                    numpy.uint8
+                )
     except (RasterioError, OSError, TypeError, ValueError) as exc:
         raise _application_error(
             status_code=500,
@@ -276,44 +308,6 @@ def _read_tile(source, tile_bounds) -> numpy.ndarray:
             details="A raster tile window could not be read.",
             field="dataset_id",
         ) from exc
-
-    color_mask = numpy.ma.getmaskarray(colors)
-    valid_pixels = ~numpy.any(color_mask, axis=0)
-    color_values = _to_uint8(numpy.asarray(colors.filled(0)))
-    if len(color_indexes) == 1:
-        red = green = blue = color_values[0]
-    else:
-        red, green, blue = color_values
-
-    alpha = numpy.where(valid_pixels, 255, 0).astype(numpy.uint8)
-    has_alpha_band = (
-        source.count in {2, 4}
-        and source.colorinterp[source.count - 1] == ColorInterp.alpha
-    )
-    if has_alpha_band:
-        try:
-            source_alpha = source.read(
-                source.count,
-                window=window,
-                out_shape=(TILE_SIZE, TILE_SIZE),
-                boundless=True,
-                masked=True,
-                fill_value=0,
-                resampling=Resampling.bilinear,
-            )
-        except (RasterioError, OSError, TypeError, ValueError) as exc:
-            raise _application_error(
-                status_code=500,
-                code="TILE_GENERATION_ERROR",
-                message="Map tiles could not be generated.",
-                details="The source raster alpha band could not be read.",
-                field="dataset_id",
-            ) from exc
-        alpha_values = _to_uint8(numpy.asarray(source_alpha.filled(0)))
-        alpha_mask = numpy.ma.getmaskarray(source_alpha)
-        alpha = numpy.where(valid_pixels & ~alpha_mask, alpha_values, 0).astype(
-            numpy.uint8
-        )
 
     return numpy.stack((red, green, blue, alpha))
 
@@ -357,23 +351,16 @@ def _remove_tile_directory(directory: Path) -> None:
     if resolved_directory.parent != resolved_root:
         raise RuntimeError("Refusing to remove a directory outside tile storage.")
     if resolved_directory.exists():
-        shutil.rmtree(resolved_directory)
+        shutil.rmtree(resolved_directory, ignore_errors=True)
 
 
 def _generate_tile_set(
     source,
     final_directory: Path,
-    temporary_directory: Path,
     *,
     min_zoom: int,
     max_zoom: int,
 ) -> None:
-    try:
-        _remove_tile_directory(temporary_directory)
-        temporary_directory.mkdir(parents=True, exist_ok=False)
-    except (OSError, RuntimeError) as exc:
-        raise _tile_write_error() from exc
-
     generated_count = 0
     try:
         for tile, tile_bounds in _intersecting_tiles(
@@ -383,7 +370,7 @@ def _generate_tile_set(
         ):
             tile_data = _read_tile(source, tile_bounds)
             tile_path = (
-                temporary_directory
+                final_directory
                 / str(tile.z)
                 / str(tile.x)
                 / f"{tile.y}.png"
@@ -399,20 +386,9 @@ def _generate_tile_set(
                 details="No XYZ tiles intersect the processed raster bounds.",
                 field="dataset_id",
             )
-
-        _remove_tile_directory(final_directory)
-        temporary_directory.replace(final_directory)
     except ApplicationError:
-        try:
-            _remove_tile_directory(temporary_directory)
-        except (OSError, RuntimeError):
-            logger.exception("Failed to remove an incomplete tile directory.")
         raise
     except (OSError, RuntimeError) as exc:
-        try:
-            _remove_tile_directory(temporary_directory)
-        except (OSError, RuntimeError):
-            logger.exception("Failed to remove an incomplete tile directory.")
         raise _tile_write_error() from exc
 
 
@@ -450,7 +426,6 @@ def generate_tiles(
     source_path = _processed_raster_path(dataset)
     relative_tile_path = _relative_tile_path(request.dataset_id)
     final_directory = _tile_directory(request.dataset_id)
-    temporary_directory = _temporary_tile_directory(request.dataset_id)
 
     with _open_processed_raster(source_path) as source:
         _require_web_mercator(source)
@@ -480,7 +455,6 @@ def generate_tiles(
             _generate_tile_set(
                 source,
                 final_directory,
-                temporary_directory,
                 min_zoom=request.min_zoom,
                 max_zoom=request.max_zoom,
             )
@@ -497,10 +471,8 @@ def generate_tiles(
             raise
         except Exception as exc:
             logger.exception("Unexpected tile generation failure.", exc_info=exc)
-            try:
-                _remove_tile_directory(temporary_directory)
-            except (OSError, RuntimeError):
-                logger.exception("Failed to remove an incomplete tile directory.")
+            # Skip temp directory cleanup
+            pass
             _set_tile_state(
                 db,
                 dataset,

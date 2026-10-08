@@ -44,12 +44,12 @@ def _control_point_not_found() -> ApplicationError:
     )
 
 
-def _database_error() -> ApplicationError:
+def _database_error(details="The control point operation could not be completed.") -> ApplicationError:
     return ApplicationError(
         status_code=500,
         code="DATABASE_ERROR",
         message="A database error occurred.",
-        details="The control point operation could not be completed.",
+        details=details,
     )
 
 
@@ -109,6 +109,7 @@ def create_control_point(
         )
         db.save_dataset(stored_dataset)
         db.insert_control_point(control_point)
+        db.mark_georeference_config_pending(stored_dataset.id)
         db.commit()
         return _single_response(control_point)
     except DatabaseError as exc:
@@ -156,12 +157,13 @@ def update_control_point(
         stored_dataset.tile_max_zoom = None
         db.save_control_point(stored_point)
         db.save_dataset(stored_dataset)
+        db.mark_georeference_config_pending(stored_dataset.id)
         db.commit()
         return _single_response(stored_point)
     except DatabaseError as exc:
         db.rollback()
         logger.exception("Failed to update a control point.", exc_info=exc)
-        raise _database_error() from exc
+        raise _database_error(str(exc)) from exc
 
 
 def delete_control_point(
@@ -182,6 +184,7 @@ def delete_control_point(
         stored_dataset.tile_max_zoom = None
         db.save_dataset(stored_dataset)
         db.delete_control_point(control_point.id)
+        db.mark_georeference_config_pending(stored_dataset.id)
         db.commit()
         return response
     except DatabaseError as exc:

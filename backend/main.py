@@ -8,11 +8,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from database import DatabaseError, DatabaseSession, get_db
+from database import DatabaseError, DatabaseSession, get_db, initialize_database
 from functions.dataset_delete.function import delete_dataset
 from functions.dataset_delete.request import DatasetDeleteRequest
 from functions.dataset_delete.response import DatasetDeleteResponse
-from functions.dataset_detail.function import get_dataset_detail
+from functions.dataset_detail.function import (
+    get_dataset_detail,
+    get_dataset_source_image,
+)
 from functions.dataset_detail.request import DatasetDetailRequest
 from functions.dataset_detail.response import DatasetDetailResponse
 from functions.dataset_list.function import list_datasets
@@ -33,12 +36,19 @@ from functions.control_points.response import (
     ControlPointListResponse,
     ControlPointResponse,
 )
-from functions.georeference.function import georeference_dataset
+from functions.georeference.function import (
+    georeference_dataset,
+    get_georeference_config,
+    mark_georeference_publication_failed,
+)
 from functions.georeference.request import (
     GeoreferenceOptionsRequest,
     GeoreferenceRequest,
 )
-from functions.georeference.response import GeoreferenceResponse
+from functions.georeference.response import (
+    GeoreferenceLookupResponse,
+    GeoreferenceResponse,
+)
 from functions.pbf_preview.function import get_pbf_preview
 from functions.pbf_preview.response import PbfPreviewResponse
 from functions.raster_process.function import process_raster
@@ -58,6 +68,29 @@ from functions.tile_read.request import TileReadRequest
 from functions.tile_read.response import TILE_READ_RESPONSES
 from functions.upload.function import upload_file
 from functions.upload.response import UploadResponse
+from functions.icon_points.function import (
+    create_icon_point,
+    delete_icon_point,
+    list_icon_points,
+    update_icon_point,
+)
+from functions.icon_points.request import (
+    CreateIconPointRequest,
+    DatasetIconPointsRequest,
+    UpdateIconPointRequest,
+    IconPointRequest,
+)
+from functions.icon_points.response import (
+    IconPointListResponse,
+    IconPointResponse,
+)
+from functions.map_projects.request import MapProjectUpdateRequest
+from functions.map_projects.response import MapProjectResponse
+from functions.map_projects.function import get_project, update_project
+from functions.map_projects.export import export_project
+from functions.map_projects.import_func import import_project
+from functions.vector_preview.function import get_vector_preview
+from functions.mbtiles.function import get_mbtiles_tile
 from models.dataset import Dataset
 from schemas.error import ApplicationError, make_error_response
 
@@ -67,14 +100,17 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI(title="MapTiler Clone API")
 
+
+@app.on_event("startup")
+def create_missing_database_tables() -> None:
+    initialize_database()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
-    allow_methods=["GET", "POST", "PUT", "DELETE"],
-    allow_headers=["Content-Type"],
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Content-Length", "ETag"],
 )
 
 
@@ -181,6 +217,36 @@ async def unexpected_error_handler(
 def health() -> dict[str, object]:
     return {"success": True, "data": {"status": "ok"}}
 
+import os
+from pydantic import BaseModel
+
+class IconListResponse(BaseModel):
+    icons: list[str]
+
+@app.get("/icons", response_model=IconListResponse)
+def get_icons() -> IconListResponse:
+    icon_dir = os.environ.get("ICON_DIR", os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "icons"))
+    if not icon_dir or not os.path.exists(icon_dir):
+        return IconListResponse(icons=[])
+    icons = [f for f in os.listdir(icon_dir) if f.endswith(('.png', '.svg', '.jpg', '.jpeg'))]
+    icon_keys = [os.path.splitext(f)[0] for f in icons]
+    return IconListResponse(icons=icon_keys)
+
+
+@app.get("/icons/{icon_key}", response_class=FileResponse)
+def get_icon(icon_key: str) -> FileResponse:
+    icon_dir = os.environ.get("ICON_DIR", os.path.join(os.path.dirname(__file__), "..", "frontend", "public", "icons"))
+    if not icon_dir or not os.path.exists(icon_dir):
+        raise StarletteHTTPException(status_code=404, detail="Icon directory not configured")
+
+    # Try finding the file with any supported extension
+    for ext in ['.png', '.svg', '.jpg', '.jpeg']:
+        path = os.path.join(icon_dir, f"{icon_key}{ext}")
+        if os.path.exists(path):
+            return FileResponse(path)
+
+    raise StarletteHTTPException(status_code=404, detail="Icon not found")
+
 
 @app.post("/upload", response_model=UploadResponse, status_code=201)
 async def upload(
@@ -208,6 +274,19 @@ def get_dataset(
     )
 
 
+@app.get("/datasets/{dataset_id}/source-image", response_class=FileResponse)
+def get_dataset_source(
+    dataset_id: UUID,
+    db: DatabaseSession = Depends(get_db),
+) -> FileResponse:
+    source_image = get_dataset_source_image(dataset_id, db)
+    return FileResponse(
+        path=source_image.path,
+        media_type=source_image.media_type,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
 @app.get(
     "/datasets/{dataset_id}/pbf-preview",
     response_model=PbfPreviewResponse,
@@ -217,6 +296,27 @@ async def get_dataset_pbf_preview(
     db: DatabaseSession = Depends(get_db),
 ) -> PbfPreviewResponse:
     return await get_pbf_preview(dataset_id, db)
+
+
+@app.get("/datasets/{dataset_id}/vector-preview")
+def get_dataset_vector_preview(
+    dataset_id: UUID,
+    raw: bool = False,
+    db: DatabaseSession = Depends(get_db),
+) -> dict[str, object]:
+    response = get_vector_preview(dataset_id, db)
+    return response["data"]["geojson"] if raw else response
+
+
+@app.get("/datasets/{dataset_id}/mbtiles/{z}/{x}/{y}")
+def read_dataset_mbtiles_tile(
+    dataset_id: UUID,
+    z: int,
+    x: int,
+    y: int,
+    db: DatabaseSession = Depends(get_db),
+):
+    return get_mbtiles_tile(dataset_id, z, x, y, db)
 
 
 @app.delete("/datasets/{dataset_id}", response_model=DatasetDeleteResponse)
@@ -300,12 +400,95 @@ def georeference_raster_dataset(
     request: GeoreferenceOptionsRequest,
     db: DatabaseSession = Depends(get_db),
 ) -> GeoreferenceResponse:
-    return georeference_dataset(
+    response = georeference_dataset(
         GeoreferenceRequest(
             dataset_id=dataset_id,
             **request.model_dump(),
         ),
         db,
+    )
+    if request.action != "save":
+        return response
+    try:
+        process_raster(
+            RasterProcessRequest(
+                dataset_id=dataset_id,
+                target_crs="EPSG:3857",
+                resampling="bilinear",
+            ),
+            db,
+        )
+        generate_tiles(
+            TileGenerationRequest(
+                dataset_id=dataset_id,
+                min_zoom=0,
+                max_zoom=18,
+            ),
+            db,
+        )
+    except ApplicationError:
+        mark_georeference_publication_failed(dataset_id, db)
+        raise
+    return response
+
+
+@app.get(
+    "/datasets/{dataset_id}/georeference",
+    response_model=GeoreferenceLookupResponse,
+)
+def get_saved_georeference(
+    dataset_id: UUID,
+    db: DatabaseSession = Depends(get_db),
+) -> GeoreferenceLookupResponse:
+    return get_georeference_config(dataset_id, db)
+
+
+@app.post(
+    "/datasets/{dataset_id}/icon-points",
+    response_model=IconPointResponse,
+    status_code=201,
+)
+def create_dataset_icon_point(
+    dataset_id: UUID,
+    request: CreateIconPointRequest,
+    db: DatabaseSession = Depends(get_db),
+) -> IconPointResponse:
+    return create_icon_point(
+        DatasetIconPointsRequest(dataset_id=dataset_id), request, db
+    )
+
+
+@app.get(
+    "/datasets/{dataset_id}/icon-points",
+    response_model=IconPointListResponse,
+)
+def get_dataset_icon_points(
+    dataset_id: UUID,
+    db: DatabaseSession = Depends(get_db),
+) -> IconPointListResponse:
+    return list_icon_points(
+        DatasetIconPointsRequest(dataset_id=dataset_id), db
+    )
+
+
+@app.put("/icon-points/{icon_point_id}", response_model=IconPointResponse)
+def replace_icon_point(
+    icon_point_id: UUID,
+    request: UpdateIconPointRequest,
+    db: DatabaseSession = Depends(get_db),
+) -> IconPointResponse:
+    return update_icon_point(
+        IconPointRequest(icon_point_id=icon_point_id), request, db
+    )
+
+
+@app.delete("/icon-points/{icon_point_id}", response_model=IconPointResponse)
+def remove_icon_point(
+    icon_point_id: UUID,
+    db: DatabaseSession = Depends(get_db),
+) -> IconPointResponse:
+    return delete_icon_point(
+        IconPointRequest(icon_point_id=icon_point_id), db
     )
 
 
@@ -361,3 +544,37 @@ def read_dataset_tile(
         TileReadRequest(dataset_id=dataset_id, z=z, x=x, y=y),
         db,
     )
+
+
+@app.get("/datasets/{dataset_id}/project", response_model=MapProjectResponse)
+def get_map_project(
+    dataset_id: UUID,
+    db: DatabaseSession = Depends(get_db),
+) -> MapProjectResponse:
+    return get_project(dataset_id, db)
+
+
+@app.put("/datasets/{dataset_id}/project", response_model=MapProjectResponse)
+def put_map_project(
+    dataset_id: UUID,
+    request: MapProjectUpdateRequest,
+    db: DatabaseSession = Depends(get_db),
+) -> MapProjectResponse:
+    return update_project(dataset_id, request, db)
+
+
+@app.get("/datasets/{dataset_id}/export/{format}")
+def export_map_project(
+    dataset_id: UUID,
+    format: str,
+    db: DatabaseSession = Depends(get_db),
+):
+    return export_project(dataset_id, format, db)
+
+
+@app.post("/map-projects/import", response_model=MapProjectResponse)
+async def post_import_project(
+    file: Annotated[UploadFile, File()],
+    db: DatabaseSession = Depends(get_db),
+) -> MapProjectResponse:
+    return await import_project(file, db)

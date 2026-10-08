@@ -335,7 +335,7 @@ def _process_to_output(
                 try:
                     for band_index in range(1, source.count + 1):
                         reproject(
-                            source=rasterio.band(source, band_index),
+                            source=source.read(band_index),
                             destination=rasterio.band(destination, band_index),
                             src_transform=source.transform,
                             src_crs=source.crs,

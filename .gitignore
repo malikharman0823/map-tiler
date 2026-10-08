@@ -18,6 +18,7 @@ generated/
 
 # Runtime uploads and caches
 backend/storage/uploads/
+backend/storage/processed/
 .npm-cache/
 __pycache__/
 *.py[cod]

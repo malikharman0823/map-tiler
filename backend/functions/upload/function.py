@@ -135,6 +135,31 @@ async def upload_file(
         _remove_saved_upload(file_path, dataset_directory)
         raise
 
+    extracted_metadata = dict(metadata_response.data.metadata)
+    extracted_metadata["format"] = metadata_response.data.format
+    extracted_metadata["category"] = metadata_response.data.category
+
+    georeferenced_path = None
+    georeference_status = "not_started"
+    processed_path = None
+    process_status = "not_started"
+    tile_status = "not_started"
+    tile_min_zoom = None
+    tile_max_zoom = None
+    tile_path = None
+
+    if metadata_response.data.format == "tiff" and extracted_metadata.get("crs") and extracted_metadata.get("transform"):
+        georeferenced_path = relative_storage_path
+        processed_path = relative_storage_path
+        georeference_status = "completed"
+        process_status = "completed"
+
+    if metadata_response.data.format == "mbtiles":
+        tile_status = "completed"
+        tile_path = relative_storage_path
+        tile_min_zoom = extracted_metadata.get("min_zoom")
+        tile_max_zoom = extracted_metadata.get("max_zoom")
+
     dataset = Dataset(
         id=dataset_id,
         filename=filename,
@@ -142,7 +167,15 @@ async def upload_file(
         content_type=validation.data.content_type,
         file_hash=file_hash,
         storage_path=relative_storage_path,
-        extracted_metadata=metadata_response.data.metadata,
+        extracted_metadata=extracted_metadata,
+        georeferenced_path=georeferenced_path,
+        georeference_status=georeference_status,
+        processed_path=processed_path,
+        process_status=process_status,
+        tile_status=tile_status,
+        tile_min_zoom=tile_min_zoom,
+        tile_max_zoom=tile_max_zoom,
+        tile_path=tile_path,
     )
 
     try:

@@ -16,6 +16,10 @@ SUPPORTED_FORMATS = {
     ".png": {"format": "png", "category": "raster"},
     ".tif": {"format": "tiff", "category": "raster"},
     ".tiff": {"format": "tiff", "category": "raster"},
+    ".gpkg": {"format": "geopackage", "category": "vector"},
+    ".geojson": {"format": "geojson", "category": "vector"},
+    ".json": {"format": "json", "category": "document"},
+    ".mbtiles": {"format": "mbtiles", "category": "tiles"},
     ".kml": {"format": "kml", "category": "vector"},
     ".kmz": {"format": "kmz", "category": "vector"},
     ".shp": {"format": "shapefile", "category": "vector"},
@@ -87,7 +91,8 @@ async def validate_file(file: UploadFile | None) -> ValidateFileResponse:
             code="UNSUPPORTED_FILE_TYPE",
             message="The uploaded file type is not supported.",
             details=(
-                "Supported formats are JPG, JPEG, PNG, TIFF, KML, KMZ, "
+                "Supported formats are GeoPackage, GeoJSON, GeoTIFF, "
+                "MapLibre style JSON, MBTiles, JPG, PNG, KML, KMZ, "
                 "Shapefile components, OSM, and OSM PBF."
             ),
             field="filename",

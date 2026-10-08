@@ -25,6 +25,8 @@ model Dataset {
   tileStatus         String         @default("not_started") @map("tile_status") @db.Text
   createdAt          DateTime       @default(now()) @map("created_at") @db.Timestamptz(6)
   controlPoints      ControlPoint[]
+  iconPointCategories IconPointCategory[]
+  iconPoints         IconPoint[]
 
   @@map("datasets")
 }
@@ -42,4 +44,36 @@ model ControlPoint {
 
   @@index([datasetId])
   @@map("control_points")
+}
+
+model IconPointCategory {
+  id          String      @id @default(uuid()) @db.Uuid
+  datasetId   String      @map("dataset_id") @db.Uuid
+  name        String      @db.Text
+  description String?     @db.Text
+  createdAt   DateTime    @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime    @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  dataset     Dataset     @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+  iconPoints  IconPoint[]
+
+  @@index([datasetId])
+  @@map("icon_point_categories")
+}
+
+model IconPoint {
+  id          String             @id @default(uuid()) @db.Uuid
+  datasetId   String             @map("dataset_id") @db.Uuid
+  categoryId  String?            @map("category_id") @db.Uuid
+  iconKey     String?            @map("icon_key") @db.Text
+  latitude    Float
+  longitude   Float
+  description String?            @db.Text
+  createdAt   DateTime           @default(now()) @map("created_at") @db.Timestamptz(6)
+  updatedAt   DateTime           @default(now()) @updatedAt @map("updated_at") @db.Timestamptz(6)
+  dataset     Dataset            @relation(fields: [datasetId], references: [id], onDelete: Cascade)
+  category    IconPointCategory? @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+
+  @@index([datasetId])
+  @@index([categoryId])
+  @@map("icon_points")
 }

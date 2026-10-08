@@ -1,18 +1,27 @@
 from collections.abc import Generator
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from uuid import UUID
 
-import psycopg
-from psycopg import Connection
-from psycopg.errors import UniqueViolation
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from sqlalchemy import create_engine, select, text
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy.orm import Session, sessionmaker
 
 from models.control_point import ControlPoint
 from models.dataset import Dataset
+from models.icon_point import IconPoint
+from models.map_project import MapProject
+from models.tables import (
+    Base,
+    ControlPointRecord,
+    DatasetRecord,
+    GeoreferenceConfig,
+    IconPointRecord,
+    MapProjectRecord,
+)
 
 
 ENV_FILE = Path(__file__).resolve().parent.parent / ".env.local"
@@ -37,9 +46,13 @@ class DuplicateDatabaseValue(DatabaseError):
     """A unique database value already exists."""
 
 
-def _psycopg_database_url(database_url: str) -> str:
-    """Remove Prisma-only query options before passing the URL to psycopg."""
+def _sqlalchemy_database_url(database_url: str) -> str:
     parts = urlsplit(database_url)
+    scheme = parts.scheme
+    if scheme.startswith("sqlite"):
+        return database_url
+    if scheme in {"postgres", "postgresql"}:
+        scheme = "postgresql+psycopg"
     query = urlencode(
         [
             (key, value)
@@ -47,288 +60,403 @@ def _psycopg_database_url(database_url: str) -> str:
             if key.lower() != "pgbouncer"
         ]
     )
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, query, parts.fragment))
+    return urlunsplit((scheme, parts.netloc, parts.path, query, parts.fragment))
 
 
 settings = Settings()
 
+# Supabase session/transaction pooler does not support prepared statements
+engine_kwargs = {"pool_pre_ping": True}
+if "pgbouncer=true" in settings.database_url.lower():
+    engine_kwargs["connect_args"] = {"prepare_threshold": None}
 
-def _dataset_from_row(row: dict[str, object]) -> Dataset:
+engine = create_engine(
+    _sqlalchemy_database_url(settings.database_url),
+    **engine_kwargs
+)
+SessionFactory = sessionmaker(bind=engine, expire_on_commit=False)
+
+
+def initialize_database() -> None:
+    Base.metadata.create_all(bind=engine)
+
+
+def _dataset_from_record(record: DatasetRecord) -> Dataset:
     return Dataset(
-        id=UUID(str(row["id"])),
-        filename=str(row["filename"]),
-        file_size=int(row["file_size"]),
-        content_type=(
-            None if row["content_type"] is None else str(row["content_type"])
-        ),
-        file_hash=str(row["file_hash"]),
-        storage_path=str(row["storage_path"]),
-        extracted_metadata=dict(row["metadata"]),
-        georeferenced_path=(
-            None
-            if row["georeferenced_path"] is None
-            else str(row["georeferenced_path"])
-        ),
-        georeference_status=str(row["georeference_status"]),
-        processed_path=(
-            None if row["processed_path"] is None else str(row["processed_path"])
-        ),
-        process_status=str(row["process_status"]),
-        tile_path=None if row["tile_path"] is None else str(row["tile_path"]),
-        tile_min_zoom=(
-            None if row["tile_min_zoom"] is None else int(row["tile_min_zoom"])
-        ),
-        tile_max_zoom=(
-            None if row["tile_max_zoom"] is None else int(row["tile_max_zoom"])
-        ),
-        tile_status=str(row["tile_status"]),
-        created_at=row["created_at"],
+        id=record.id,
+        filename=record.filename,
+        file_size=record.file_size,
+        content_type=record.content_type,
+        file_hash=record.file_hash,
+        storage_path=record.storage_path,
+        extracted_metadata=dict(record.metadata_value),
+        georeferenced_path=record.georeferenced_path,
+        georeference_status=record.georeference_status,
+        processed_path=record.processed_path,
+        process_status=record.process_status,
+        tile_path=record.tile_path,
+        tile_min_zoom=record.tile_min_zoom,
+        tile_max_zoom=record.tile_max_zoom,
+        tile_status=record.tile_status,
+        created_at=record.created_at,
     )
 
 
-def _control_point_from_row(row: dict[str, object]) -> ControlPoint:
+def _control_point_from_record(record: ControlPointRecord) -> ControlPoint:
     return ControlPoint(
-        id=UUID(str(row["id"])),
-        dataset_id=UUID(str(row["dataset_id"])),
-        image_x=float(row["image_x"]),
-        image_y=float(row["image_y"]),
-        longitude=float(row["longitude"]),
-        latitude=float(row["latitude"]),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
+        id=record.id,
+        dataset_id=record.dataset_id,
+        image_x=record.image_x,
+        image_y=record.image_y,
+        longitude=record.longitude,
+        latitude=record.latitude,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
     )
 
 
-DATASET_COLUMNS = """
-    id, filename, file_size, content_type, file_hash, storage_path, metadata,
-    georeferenced_path, georeference_status, processed_path, process_status,
-    tile_path, tile_min_zoom, tile_max_zoom, tile_status, created_at
-"""
-CONTROL_POINT_COLUMNS = """
-    id, dataset_id, image_x, image_y, longitude, latitude, created_at, updated_at
-"""
+def _icon_point_from_record(record: IconPointRecord) -> IconPoint:
+    return IconPoint(
+        id=record.id,
+        dataset_id=record.dataset_id,
+        icon_key=record.icon_key,
+        latitude=record.latitude,
+        longitude=record.longitude,
+        description=record.description,
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
+
+
+def _map_project_from_record(record: MapProjectRecord) -> MapProject:
+    return MapProject(
+        id=record.id,
+        name=record.name,
+        dataset_id=record.dataset_id,
+        configuration=dict(record.configuration),
+        created_at=record.created_at,
+        updated_at=record.updated_at,
+    )
 
 
 class DatabaseSession:
-    def __init__(self, connection: Connection[dict[str, object]]) -> None:
-        self.connection = connection
+    def __init__(self, session: Session) -> None:
+        self.session = session
+
+    def get_map_project(self, project_id: UUID) -> MapProject | None:
+        try:
+            record = self.session.get(MapProjectRecord, project_id)
+            return None if record is None else _map_project_from_record(record)
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def get_map_project_by_dataset_id(self, dataset_id: UUID) -> MapProject | None:
+        try:
+            record = self.session.scalar(
+                select(MapProjectRecord).where(MapProjectRecord.dataset_id == dataset_id).order_by(MapProjectRecord.created_at.desc())
+            )
+            return None if record is None else _map_project_from_record(record)
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def insert_map_project(self, project: MapProject) -> None:
+        record = MapProjectRecord(
+            id=project.id,
+            name=project.name,
+            dataset_id=project.dataset_id,
+            configuration=project.configuration,
+            created_at=project.created_at,
+            updated_at=project.updated_at,
+        )
+        try:
+            self.session.add(record)
+            self.session.flush()
+            project.created_at = record.created_at
+            project.updated_at = record.updated_at
+        except IntegrityError as exc:
+            raise DuplicateDatabaseValue from exc
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def save_map_project(self, project: MapProject) -> None:
+        try:
+            record = self.session.get(MapProjectRecord, project.id)
+            if record is None:
+                raise DatabaseError("Map project does not exist.")
+            record.name = project.name
+            record.dataset_id = project.dataset_id
+            record.configuration = project.configuration
+            record.updated_at = datetime.now(timezone.utc)
+            self.session.flush()
+            project.updated_at = record.updated_at
+        except IntegrityError as exc:
+            raise DuplicateDatabaseValue from exc
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
 
     def get_dataset(self, dataset_id: UUID) -> Dataset | None:
         try:
-            row = self.connection.execute(
-                f"SELECT {DATASET_COLUMNS} FROM datasets WHERE id = %s",
-                (dataset_id,),
-            ).fetchone()
-            return None if row is None else _dataset_from_row(row)
-        except psycopg.Error as exc:
+            record = self.session.get(DatasetRecord, dataset_id)
+            return None if record is None else _dataset_from_record(record)
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def find_dataset_by_hash(self, file_hash: str) -> Dataset | None:
         try:
-            row = self.connection.execute(
-                f"SELECT {DATASET_COLUMNS} FROM datasets WHERE file_hash = %s",
-                (file_hash,),
-            ).fetchone()
-            return None if row is None else _dataset_from_row(row)
-        except psycopg.Error as exc:
+            record = self.session.scalar(
+                select(DatasetRecord).where(DatasetRecord.file_hash == file_hash)
+            )
+            return None if record is None else _dataset_from_record(record)
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def list_datasets(self) -> list[Dataset]:
         try:
-            rows = self.connection.execute(
-                f"SELECT {DATASET_COLUMNS} FROM datasets "
-                "ORDER BY created_at DESC, id DESC"
-            ).fetchall()
-            return [_dataset_from_row(row) for row in rows]
-        except psycopg.Error as exc:
+            records = self.session.scalars(
+                select(DatasetRecord).order_by(
+                    DatasetRecord.created_at.desc(), DatasetRecord.id.desc()
+                )
+            ).all()
+            return [_dataset_from_record(record) for record in records]
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def insert_dataset(self, dataset: Dataset) -> None:
+        record = DatasetRecord(
+            id=dataset.id,
+            filename=dataset.filename,
+            file_size=dataset.file_size,
+            content_type=dataset.content_type,
+            file_hash=dataset.file_hash,
+            storage_path=dataset.storage_path,
+            metadata_value=dataset.extracted_metadata,
+            georeferenced_path=dataset.georeferenced_path,
+            georeference_status=dataset.georeference_status,
+            processed_path=dataset.processed_path,
+            process_status=dataset.process_status,
+            tile_path=dataset.tile_path,
+            tile_min_zoom=dataset.tile_min_zoom,
+            tile_max_zoom=dataset.tile_max_zoom,
+            tile_status=dataset.tile_status,
+            created_at=dataset.created_at,
+        )
         try:
-            row = self.connection.execute(
-                """
-                INSERT INTO datasets (
-                    id, filename, file_size, content_type, file_hash, storage_path,
-                    metadata, georeferenced_path, georeference_status,
-                    processed_path, process_status, tile_path, tile_min_zoom,
-                    tile_max_zoom, tile_status, created_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s
-                )
-                RETURNING created_at
-                """,
-                (
-                    dataset.id,
-                    dataset.filename,
-                    dataset.file_size,
-                    dataset.content_type,
-                    dataset.file_hash,
-                    dataset.storage_path,
-                    Jsonb(dataset.extracted_metadata),
-                    dataset.georeferenced_path,
-                    dataset.georeference_status,
-                    dataset.processed_path,
-                    dataset.process_status,
-                    dataset.tile_path,
-                    dataset.tile_min_zoom,
-                    dataset.tile_max_zoom,
-                    dataset.tile_status,
-                    dataset.created_at,
-                ),
-            ).fetchone()
-            dataset.created_at = row["created_at"]
-        except UniqueViolation as exc:
+            self.session.add(record)
+            self.session.flush()
+            dataset.created_at = record.created_at
+        except IntegrityError as exc:
             raise DuplicateDatabaseValue from exc
-        except psycopg.Error as exc:
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def save_dataset(self, dataset: Dataset) -> None:
         try:
-            self.connection.execute(
-                """
-                UPDATE datasets SET
-                    filename = %s, file_size = %s, content_type = %s,
-                    file_hash = %s, storage_path = %s, metadata = %s,
-                    georeferenced_path = %s, georeference_status = %s,
-                    processed_path = %s, process_status = %s, tile_path = %s,
-                    tile_min_zoom = %s, tile_max_zoom = %s, tile_status = %s
-                WHERE id = %s
-                """,
-                (
-                    dataset.filename,
-                    dataset.file_size,
-                    dataset.content_type,
-                    dataset.file_hash,
-                    dataset.storage_path,
-                    Jsonb(dataset.extracted_metadata),
-                    dataset.georeferenced_path,
-                    dataset.georeference_status,
-                    dataset.processed_path,
-                    dataset.process_status,
-                    dataset.tile_path,
-                    dataset.tile_min_zoom,
-                    dataset.tile_max_zoom,
-                    dataset.tile_status,
-                    dataset.id,
-                ),
-            )
-        except UniqueViolation as exc:
+            record = self.session.get(DatasetRecord, dataset.id)
+            if record is None:
+                raise DatabaseError("Dataset does not exist.")
+            for name, value in {
+                "filename": dataset.filename,
+                "file_size": dataset.file_size,
+                "content_type": dataset.content_type,
+                "file_hash": dataset.file_hash,
+                "storage_path": dataset.storage_path,
+                "metadata_value": dataset.extracted_metadata,
+                "georeferenced_path": dataset.georeferenced_path,
+                "georeference_status": dataset.georeference_status,
+                "processed_path": dataset.processed_path,
+                "process_status": dataset.process_status,
+                "tile_path": dataset.tile_path,
+                "tile_min_zoom": dataset.tile_min_zoom,
+                "tile_max_zoom": dataset.tile_max_zoom,
+                "tile_status": dataset.tile_status,
+            }.items():
+                setattr(record, name, value)
+            self.session.flush()
+        except IntegrityError as exc:
             raise DuplicateDatabaseValue from exc
-        except psycopg.Error as exc:
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def delete_dataset(self, dataset_id: UUID) -> None:
         try:
-            self.connection.execute("DELETE FROM datasets WHERE id = %s", (dataset_id,))
-        except psycopg.Error as exc:
+            record = self.session.get(DatasetRecord, dataset_id)
+            if record is not None:
+                self.session.delete(record)
+                self.session.flush()
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def get_control_point(self, control_point_id: UUID) -> ControlPoint | None:
         try:
-            row = self.connection.execute(
-                f"SELECT {CONTROL_POINT_COLUMNS} FROM control_points WHERE id = %s",
-                (control_point_id,),
-            ).fetchone()
-            return None if row is None else _control_point_from_row(row)
-        except psycopg.Error as exc:
+            record = self.session.get(ControlPointRecord, control_point_id)
+            return None if record is None else _control_point_from_record(record)
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def list_control_points(self, dataset_id: UUID) -> list[ControlPoint]:
         try:
-            rows = self.connection.execute(
-                f"SELECT {CONTROL_POINT_COLUMNS} FROM control_points "
-                "WHERE dataset_id = %s ORDER BY created_at, id",
-                (dataset_id,),
-            ).fetchall()
-            return [_control_point_from_row(row) for row in rows]
-        except psycopg.Error as exc:
+            records = self.session.scalars(
+                select(ControlPointRecord)
+                .where(ControlPointRecord.dataset_id == dataset_id)
+                .order_by(ControlPointRecord.created_at, ControlPointRecord.id)
+            ).all()
+            return [_control_point_from_record(record) for record in records]
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def insert_control_point(self, point: ControlPoint) -> None:
+        record = ControlPointRecord(
+            id=point.id,
+            dataset_id=point.dataset_id,
+            image_x=point.image_x,
+            image_y=point.image_y,
+            longitude=point.longitude,
+            latitude=point.latitude,
+            created_at=point.created_at,
+            updated_at=point.updated_at,
+        )
         try:
-            row = self.connection.execute(
-                """
-                INSERT INTO control_points (
-                    id, dataset_id, image_x, image_y, longitude, latitude,
-                    created_at, updated_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING created_at, updated_at
-                """,
-                (
-                    point.id,
-                    point.dataset_id,
-                    point.image_x,
-                    point.image_y,
-                    point.longitude,
-                    point.latitude,
-                    point.created_at,
-                    point.updated_at,
-                ),
-            ).fetchone()
-            point.created_at = row["created_at"]
-            point.updated_at = row["updated_at"]
-        except psycopg.Error as exc:
+            self.session.add(record)
+            self.session.flush()
+            point.created_at = record.created_at
+            point.updated_at = record.updated_at
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def save_control_point(self, point: ControlPoint) -> None:
         try:
-            row = self.connection.execute(
-                """
-                UPDATE control_points SET
-                    image_x = %s, image_y = %s, longitude = %s, latitude = %s,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = %s
-                RETURNING updated_at
-                """,
-                (
-                    point.image_x,
-                    point.image_y,
-                    point.longitude,
-                    point.latitude,
-                    point.id,
-                ),
-            ).fetchone()
-            if row is not None:
-                point.updated_at = row["updated_at"]
-        except psycopg.Error as exc:
+            record = self.session.get(ControlPointRecord, point.id)
+            if record is None:
+                raise DatabaseError("Control point does not exist.")
+            record.image_x = point.image_x
+            record.image_y = point.image_y
+            record.longitude = point.longitude
+            record.latitude = point.latitude
+            record.updated_at = datetime.now(timezone.utc)
+            self.session.flush()
+            point.updated_at = record.updated_at
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def delete_control_point(self, control_point_id: UUID) -> None:
         try:
-            self.connection.execute(
-                "DELETE FROM control_points WHERE id = %s",
-                (control_point_id,),
-            )
-        except psycopg.Error as exc:
+            record = self.session.get(ControlPointRecord, control_point_id)
+            if record is not None:
+                self.session.delete(record)
+                self.session.flush()
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
+
+    def get_active_georeference_config(
+        self, dataset_id: UUID
+    ) -> GeoreferenceConfig | None:
+        try:
+            return self.session.scalar(
+                select(GeoreferenceConfig).where(
+                    GeoreferenceConfig.dataset_id == dataset_id,
+                    GeoreferenceConfig.is_active.is_(True),
+                )
+            )
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def save_georeference_config(self, config: GeoreferenceConfig) -> None:
+        try:
+            self.session.add(config)
+            self.session.flush()
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def mark_georeference_config_pending(self, dataset_id: UUID) -> None:
+        config = self.get_active_georeference_config(dataset_id)
+        if config is not None:
+            config.status = "pending"
+            config.updated_at = datetime.now(timezone.utc)
+
+    def get_icon_point(self, icon_point_id: UUID) -> IconPoint | None:
+        try:
+            record = self.session.get(IconPointRecord, icon_point_id)
+            return None if record is None else _icon_point_from_record(record)
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def list_icon_points(self, dataset_id: UUID) -> list[IconPoint]:
+        try:
+            records = self.session.scalars(
+                select(IconPointRecord)
+                .where(IconPointRecord.dataset_id == dataset_id)
+                .order_by(IconPointRecord.created_at, IconPointRecord.id)
+            ).all()
+            return [_icon_point_from_record(record) for record in records]
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def insert_icon_point(self, point: IconPoint) -> None:
+        record = IconPointRecord(
+            id=point.id,
+            dataset_id=point.dataset_id,
+            icon_key=point.icon_key,
+            latitude=point.latitude,
+            longitude=point.longitude,
+            description=point.description,
+            created_at=point.created_at,
+            updated_at=point.updated_at,
+        )
+        try:
+            self.session.add(record)
+            self.session.flush()
+            point.created_at = record.created_at
+            point.updated_at = record.updated_at
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def save_icon_point(self, point: IconPoint) -> None:
+        try:
+            record = self.session.get(IconPointRecord, point.id)
+            if record is None:
+                raise DatabaseError("Icon point does not exist.")
+            record.icon_key = point.icon_key
+            record.latitude = point.latitude
+            record.longitude = point.longitude
+            record.description = point.description
+            record.updated_at = datetime.now(timezone.utc)
+            self.session.flush()
+            point.updated_at = record.updated_at
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+    def delete_icon_point(self, icon_point_id: UUID) -> None:
+        try:
+            record = self.session.get(IconPointRecord, icon_point_id)
+            if record is not None:
+                self.session.delete(record)
+                self.session.flush()
+        except SQLAlchemyError as exc:
+            raise DatabaseError from exc
+
+
 
     def ping(self) -> None:
         try:
-            self.connection.execute("SELECT 1").fetchone()
-        except psycopg.Error as exc:
+            self.session.execute(text("SELECT 1")).scalar_one()
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def commit(self) -> None:
         try:
-            self.connection.commit()
-        except psycopg.Error as exc:
+            self.session.commit()
+        except SQLAlchemyError as exc:
             raise DatabaseError from exc
 
     def rollback(self) -> None:
-        self.connection.rollback()
+        self.session.rollback()
 
     def close(self) -> None:
-        self.connection.close()
+        self.session.close()
 
 
 def get_db() -> Generator[DatabaseSession, None, None]:
-    connection = psycopg.connect(
-        _psycopg_database_url(settings.database_url),
-        row_factory=dict_row,
-        prepare_threshold=None,
-    )
-    database = DatabaseSession(connection)
+    database = DatabaseSession(SessionFactory())
     try:
         yield database
     finally:

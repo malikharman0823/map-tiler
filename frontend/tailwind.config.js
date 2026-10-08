@@ -12,10 +12,14 @@ export default {
       wide: "1441px",
     },
     extend: {
+      fontFamily: {
+        sans: ['Inter', 'sans-serif'],
+        mono: ['JetBrains Mono', 'monospace'],
+      },
       colors: {
-        primary: "#0066cc",
-        "primary-focus": "#0071e3",
-        "primary-on-dark": "#2997ff",
+        primary: "#16a34a",
+        "primary-focus": "#15803d",
+        "primary-on-dark": "#22c55e",
         ink: "#1d1d1f",
         muted: "#7a7a7a",
         hairline: "#e0e0e0",
