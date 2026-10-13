@@ -2,8 +2,9 @@ import logging
 from pathlib import Path
 
 from fastapi.responses import FileResponse
-from database import DatabaseError, DatabaseSession
+from storage.session import RepositoryError, SessionRepository
 
+from config import settings
 from functions.tile_read.request import TileReadRequest
 from models.dataset import Dataset
 from schemas.error import ApplicationError
@@ -73,10 +74,10 @@ def _validate_coordinates(request: TileReadRequest) -> None:
         )
 
 
-def _load_dataset(db: DatabaseSession, request: TileReadRequest) -> Dataset:
+def _load_dataset(db: SessionRepository, request: TileReadRequest) -> Dataset:
     try:
         dataset = db.get_dataset(request.dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to load the dataset for tile reading.", exc_info=exc)
         raise _database_error() from exc
@@ -121,13 +122,22 @@ def _validate_zoom(dataset: Dataset, z: int) -> None:
 
 def _tile_path(dataset: Dataset, request: TileReadRequest) -> Path:
     expected_root = (TILES_DIRECTORY / str(dataset.id)).resolve()
+    if not dataset.tile_path:
+        raise _tile_read_error()
     try:
-        stored_root = (BACKEND_DIRECTORY / dataset.tile_path).resolve()
+        stored = Path(dataset.tile_path)
+        stored_root = stored.resolve() if stored.is_absolute() else (BACKEND_DIRECTORY / stored).resolve()
     except (OSError, RuntimeError, TypeError):
         logger.exception("The stored tile directory could not be resolved.")
         raise _tile_read_error()
 
-    if stored_root != expected_root:
+    sessions_root = Path(settings.session_storage_dir).resolve()
+    is_valid_root = (
+        stored_root == expected_root
+        or (stored_root.is_relative_to(sessions_root) and str(dataset.id) in stored_root.parts)
+        or (stored_root.exists() and str(dataset.id) in stored_root.parts)
+    )
+    if not is_valid_root:
         logger.error("The stored tile directory is outside its dataset directory.")
         raise _tile_read_error()
 
@@ -165,7 +175,7 @@ def _tile_path(dataset: Dataset, request: TileReadRequest) -> Path:
 
 def read_tile(
     request: TileReadRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> FileResponse:
     _validate_coordinates(request)
     dataset = _load_dataset(db, request)

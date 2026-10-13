@@ -3,7 +3,7 @@ from pathlib import Path
 import shutil
 import stat
 
-from database import DatabaseError, DatabaseSession
+from storage.session import RepositoryError, SessionRepository
 
 from functions.dataset_delete.request import DatasetDeleteRequest
 from functions.dataset_delete.response import (
@@ -65,12 +65,12 @@ def _delete_error() -> ApplicationError:
 
 
 def _load_dataset(
-    db: DatabaseSession,
+    db: SessionRepository,
     request: DatasetDeleteRequest,
 ) -> Dataset:
     try:
         dataset = db.get_dataset(request.dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to load the dataset for deletion.", exc_info=exc)
         raise _database_error() from exc
@@ -91,21 +91,46 @@ def _safe_dataset_directory(root: Path, dataset_id) -> Path:
     return resolved_directory
 
 
-def _dataset_directories(dataset: Dataset) -> tuple[Path, Path, Path]:
-    return (
+def _dataset_directories(dataset: Dataset, db: SessionRepository | None = None) -> list[Path]:
+    dirs = [
         _safe_dataset_directory(UPLOADS_DIRECTORY, dataset.id),
         _safe_dataset_directory(PROCESSED_DIRECTORY, dataset.id),
         _safe_dataset_directory(TILES_DIRECTORY, dataset.id),
-    )
+    ]
+    if db is not None and hasattr(db, "get_dataset_dir"):
+        ds_dir = db.get_dataset_dir(dataset.id)
+        if ds_dir not in dirs:
+            dirs.append(ds_dir)
+    return dirs
+
+
+def _remove_dataset_files(dataset: Dataset) -> None:
+    for path_attr in (
+        dataset.storage_path,
+        dataset.processed_path,
+        dataset.georeferenced_path,
+        dataset.tile_path,
+    ):
+        if path_attr:
+            p = Path(path_attr)
+            target = p.resolve() if p.is_absolute() else (BACKEND_DIRECTORY / p).resolve()
+            if target.exists():
+                try:
+                    if target.is_dir():
+                        _robust_rmtree(target)
+                    else:
+                        target.unlink(missing_ok=True)
+                except Exception as exc:
+                    logger.warning("Failed to remove file %s: %s", target, exc)
 
 
 def _prepare_database_delete(
-    db: DatabaseSession,
+    db: SessionRepository,
     dataset: Dataset,
 ) -> None:
     try:
         db.delete_dataset(dataset.id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to prepare the dataset deletion.", exc_info=exc)
         raise _database_error() from exc
@@ -115,22 +140,52 @@ def _prepare_database_delete(
         raise _delete_error() from exc
 
 
-def _remove_dataset_directories(directories: tuple[Path, Path, Path]) -> None:
-    try:
-        for directory in directories:
-            if directory.exists():
-                if not directory.is_dir():
-                    raise OSError("The dataset storage path is not a directory.")
-                directory.chmod(directory.stat().st_mode | stat.S_IWRITE)
-                shutil.rmtree(directory)
-    except OSError as exc:
-        logger.exception("Failed to remove dataset storage.", exc_info=exc)
-        raise _file_delete_error() from exc
+def _robust_rmtree(directory: Path) -> None:
+    import gc
+    import os
+    import time
+    import sys
+
+    def _handle_error(func, path, exc_info):
+        try:
+            os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+            func(path)
+        except Exception:
+            pass
+
+    gc.collect()
+    for attempt in range(4):
+        try:
+            if not directory.exists():
+                return
+            if sys.version_info >= (3, 12):
+                shutil.rmtree(directory, onexc=_handle_error)
+            else:
+                shutil.rmtree(directory, onerror=_handle_error)
+            return
+        except OSError:
+            if attempt < 3:
+                time.sleep(0.15 * (attempt + 1))
+                gc.collect()
+            else:
+                logger.warning("Could not cleanly delete directory %s after retries", directory)
+
+
+def _remove_dataset_directories(directories: list[Path] | tuple[Path, ...]) -> None:
+    for directory in directories:
+        if directory.exists():
+            if not directory.is_dir():
+                try:
+                    directory.unlink(missing_ok=True)
+                except OSError as exc:
+                    logger.warning("Failed to remove dataset file %s: %s", directory, exc)
+                continue
+            _robust_rmtree(directory)
 
 
 def delete_dataset(
     request: DatasetDeleteRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> DatasetDeleteResponse:
     dataset = _load_dataset(db, request)
     response = DatasetDeleteResponse(
@@ -140,18 +195,18 @@ def delete_dataset(
             message="Dataset deleted successfully.",
         )
     )
-    directories = _dataset_directories(dataset)
+    directories = _dataset_directories(dataset, db)
     _prepare_database_delete(db, dataset)
 
     try:
         _remove_dataset_directories(directories)
-    except ApplicationError:
-        db.rollback()
-        raise
+        _remove_dataset_files(dataset)
+    except Exception as exc:
+        logger.warning("Storage directory cleanup encountered an error: %s", exc)
 
     try:
         db.commit()
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to commit the dataset deletion.", exc_info=exc)
         raise _database_error() from exc

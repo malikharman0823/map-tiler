@@ -1,7 +1,7 @@
 import logging
 from uuid import UUID
 
-from database import DatabaseError, DatabaseSession
+from storage.session import RepositoryError, SessionRepository
 
 from functions.control_points.request import (
     ControlPointRequest,
@@ -53,7 +53,7 @@ def _database_error(details="The control point operation could not be completed.
     )
 
 
-def _require_dataset(db: DatabaseSession, dataset_id: UUID) -> Dataset:
+def _require_dataset(db: SessionRepository, dataset_id: UUID) -> Dataset:
     dataset = db.get_dataset(dataset_id)
     if dataset is None:
         raise _dataset_not_found()
@@ -61,7 +61,7 @@ def _require_dataset(db: DatabaseSession, dataset_id: UUID) -> Dataset:
 
 
 def _require_control_point(
-    db: DatabaseSession,
+    db: SessionRepository,
     control_point_id: UUID,
 ) -> ControlPoint:
     control_point = db.get_control_point(control_point_id)
@@ -79,7 +79,7 @@ def _single_response(control_point: ControlPoint) -> ControlPointResponse:
 def create_control_point(
     dataset: DatasetControlPointsRequest,
     request: CreateControlPointRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> ControlPointResponse:
     if request.dataset_id != dataset.dataset_id:
         raise ApplicationError(
@@ -112,7 +112,7 @@ def create_control_point(
         db.mark_georeference_config_pending(stored_dataset.id)
         db.commit()
         return _single_response(control_point)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to create a control point.", exc_info=exc)
         raise _database_error() from exc
@@ -120,7 +120,7 @@ def create_control_point(
 
 def list_control_points(
     request: DatasetControlPointsRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> ControlPointListResponse:
     try:
         _require_dataset(db, request.dataset_id)
@@ -129,7 +129,7 @@ def list_control_points(
         return ControlPointListResponse(
             data=ControlPointListData(points=items, count=len(items))
         )
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to list control points.", exc_info=exc)
         raise _database_error() from exc
@@ -138,7 +138,7 @@ def list_control_points(
 def update_control_point(
     control_point: ControlPointRequest,
     request: UpdateControlPointRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> ControlPointResponse:
     try:
         stored_point = _require_control_point(db, control_point.control_point_id)
@@ -160,7 +160,7 @@ def update_control_point(
         db.mark_georeference_config_pending(stored_dataset.id)
         db.commit()
         return _single_response(stored_point)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to update a control point.", exc_info=exc)
         raise _database_error(str(exc)) from exc
@@ -168,7 +168,7 @@ def update_control_point(
 
 def delete_control_point(
     request: ControlPointRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> ControlPointResponse:
     try:
         control_point = _require_control_point(db, request.control_point_id)
@@ -187,7 +187,7 @@ def delete_control_point(
         db.mark_georeference_config_pending(stored_dataset.id)
         db.commit()
         return response
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to delete a control point.", exc_info=exc)
         raise _database_error() from exc

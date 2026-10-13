@@ -8,7 +8,8 @@ from rasterio.crs import CRS
 from rasterio.enums import Resampling
 from rasterio.errors import RasterioError
 from rasterio.warp import calculate_default_transform, reproject
-from database import DatabaseError, DatabaseSession
+from config import settings
+from storage.session import RepositoryError, SessionRepository
 
 from functions.raster_process.request import RasterProcessRequest
 from functions.raster_process.response import (
@@ -67,10 +68,10 @@ def _database_error() -> ApplicationError:
     )
 
 
-def _load_dataset(db: DatabaseSession, dataset_id: UUID) -> Dataset:
+def _load_dataset(db: SessionRepository, dataset_id: UUID) -> Dataset:
     try:
         dataset = db.get_dataset(dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to load the dataset for raster processing.", exc_info=exc)
         raise _database_error() from exc
@@ -87,7 +88,7 @@ def _load_dataset(db: DatabaseSession, dataset_id: UUID) -> Dataset:
 
 
 def _set_dataset_state(
-    db: DatabaseSession,
+    db: SessionRepository,
     dataset: Dataset,
     *,
     status: str,
@@ -102,7 +103,7 @@ def _set_dataset_state(
     try:
         db.save_dataset(dataset)
         db.commit()
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to update raster processing status.", exc_info=exc)
         raise _database_error() from exc
@@ -157,20 +158,25 @@ def _source_path(dataset: Dataset) -> Path:
             field="dataset_id",
         )
 
-    candidate = (BACKEND_DIRECTORY / dataset.georeferenced_path).resolve()
-    expected_directory = (PROCESSED_DIRECTORY / str(dataset.id)).resolve()
-    try:
-        candidate.relative_to(expected_directory)
-    except ValueError as exc:
-        raise _application_error(
-            status_code=404,
-            code="GEOTIFF_NOT_FOUND",
-            message="The georeferenced raster was not found.",
-            details="Run the georeference function before raster processing.",
-            field="dataset_id",
-        ) from exc
+    geo_p = Path(dataset.georeferenced_path)
+    candidate = geo_p.resolve() if geo_p.is_absolute() else (BACKEND_DIRECTORY / dataset.georeferenced_path).resolve()
+    processed_directory = (PROCESSED_DIRECTORY / str(dataset.id)).resolve()
+    uploads_directory = (BACKEND_DIRECTORY / "storage" / "uploads" / str(dataset.id)).resolve()
+    sessions_root = Path(settings.session_storage_dir).resolve()
 
-    if not candidate.is_file():
+    is_valid_path = False
+    for safe_root in (processed_directory, uploads_directory, sessions_root, (BACKEND_DIRECTORY / "temp").resolve()):
+        try:
+            if candidate.is_relative_to(safe_root):
+                is_valid_path = True
+                break
+        except (ValueError, TypeError):
+            pass
+
+    if not is_valid_path and candidate.exists() and str(dataset.id) in candidate.parts:
+        is_valid_path = True
+
+    if not is_valid_path or not candidate.is_file():
         raise _application_error(
             status_code=404,
             code="GEOTIFF_NOT_FOUND",
@@ -181,13 +187,23 @@ def _source_path(dataset: Dataset) -> Path:
     return candidate
 
 
-def _relative_output_path(dataset_id: UUID) -> str:
+def _relative_output_path(dataset_id: UUID, db: SessionRepository | None = None) -> str:
+    if db is not None and getattr(db, "_legacy_engine", None) is None and hasattr(db, "get_dataset_dir"):
+        out = _output_path(dataset_id, db)
+        try:
+            return out.relative_to(BACKEND_DIRECTORY).as_posix()
+        except ValueError:
+            return out.as_posix()
     return (
         Path("storage") / "processed" / str(dataset_id) / "processed.tif"
     ).as_posix()
 
 
-def _output_path(dataset_id: UUID) -> Path:
+def _output_path(dataset_id: UUID, db: SessionRepository | None = None) -> Path:
+    if db is not None and getattr(db, "_legacy_engine", None) is None and hasattr(db, "get_dataset_dir"):
+        out_dir = db.get_dataset_dir(dataset_id) / "processed"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return out_dir / "processed.tif"
     return PROCESSED_DIRECTORY / str(dataset_id) / "processed.tif"
 
 
@@ -252,7 +268,10 @@ def _existing_output_info(output_path: Path) -> RasterInfo | None:
         return None
     try:
         with rasterio.open(output_path) as output:
-            return _raster_info(output)
+            info = _raster_info(output)
+        import gc
+        gc.collect()
+        return info
     except (ApplicationError, RasterioError, OSError, ValueError) as exc:
         logger.warning("Ignoring an invalid existing processed raster.", exc_info=exc)
         return None
@@ -346,7 +365,17 @@ def _process_to_output(
                         )
                 except (RasterioError, TypeError, ValueError) as exc:
                     raise _reprojection_error() from exc
-        temporary_path.replace(output_path)
+        import gc
+        gc.collect()
+        try:
+            output_path.unlink(missing_ok=True)
+            temporary_path.replace(output_path)
+        except OSError:
+            import time
+            time.sleep(0.1)
+            gc.collect()
+            output_path.unlink(missing_ok=True)
+            temporary_path.replace(output_path)
     except ApplicationError:
         try:
             temporary_path.unlink(missing_ok=True)
@@ -404,15 +433,15 @@ def _response(
 
 def process_raster(
     request: RasterProcessRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> RasterProcessResponse:
     dataset = _load_dataset(db, request.dataset_id)
     _validate_dataset_format(dataset)
     target_crs = _target_crs(request.target_crs)
     resampling_name, resampling = _resampling_method(request.resampling)
     source_path = _source_path(dataset)
-    relative_output_path = _relative_output_path(request.dataset_id)
-    output_path = _output_path(request.dataset_id)
+    relative_output_path = _relative_output_path(request.dataset_id, db)
+    output_path = _output_path(request.dataset_id, db)
 
     with _open_source(source_path) as source:
         source_crs = _require_source_crs(source).to_string()

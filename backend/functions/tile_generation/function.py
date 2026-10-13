@@ -9,7 +9,8 @@ import rasterio
 from rasterio.crs import CRS
 from rasterio.enums import ColorInterp, Resampling
 from rasterio.errors import RasterioError
-from database import DatabaseError, DatabaseSession
+from config import settings
+from storage.session import RepositoryError, SessionRepository
 
 from functions.tile_generation.request import TileGenerationRequest
 from functions.tile_generation.response import (
@@ -55,10 +56,10 @@ def _database_error() -> ApplicationError:
     )
 
 
-def _load_dataset(db: DatabaseSession, dataset_id: UUID) -> Dataset:
+def _load_dataset(db: SessionRepository, dataset_id: UUID) -> Dataset:
     try:
         dataset = db.get_dataset(dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to load the dataset for tile generation.", exc_info=exc)
         raise _database_error() from exc
@@ -75,7 +76,7 @@ def _load_dataset(db: DatabaseSession, dataset_id: UUID) -> Dataset:
 
 
 def _set_tile_state(
-    db: DatabaseSession,
+    db: SessionRepository,
     dataset: Dataset,
     *,
     status: str,
@@ -90,7 +91,7 @@ def _set_tile_state(
     try:
         db.save_dataset(dataset)
         db.commit()
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to update tile generation status.", exc_info=exc)
         raise _database_error() from exc
@@ -121,20 +122,24 @@ def _processed_raster_path(dataset: Dataset) -> Path:
             field="dataset_id",
         )
 
-    candidate = (BACKEND_DIRECTORY / dataset.processed_path).resolve()
+    cand = Path(dataset.processed_path)
+    candidate = cand.resolve() if cand.is_absolute() else (BACKEND_DIRECTORY / dataset.processed_path).resolve()
     expected_directory = (PROCESSED_DIRECTORY / str(dataset.id)).resolve()
-    try:
-        candidate.relative_to(expected_directory)
-    except ValueError as exc:
-        raise _application_error(
-            status_code=404,
-            code="PROCESSED_RASTER_NOT_FOUND",
-            message="The processed raster was not found.",
-            details="The processed GeoTIFF is unavailable on the server.",
-            field="dataset_id",
-        ) from exc
+    sessions_root = Path(settings.session_storage_dir).resolve()
 
-    if not candidate.is_file():
+    is_valid_path = False
+    for safe_root in (expected_directory, sessions_root, (BACKEND_DIRECTORY / "temp").resolve()):
+        try:
+            if candidate.is_relative_to(safe_root):
+                is_valid_path = True
+                break
+        except (ValueError, TypeError):
+            pass
+
+    if not is_valid_path and candidate.exists() and str(dataset.id) in candidate.parts:
+        is_valid_path = True
+
+    if not is_valid_path or not candidate.is_file():
         raise _application_error(
             status_code=404,
             code="PROCESSED_RASTER_NOT_FOUND",
@@ -145,15 +150,29 @@ def _processed_raster_path(dataset: Dataset) -> Path:
     return candidate
 
 
-def _relative_tile_path(dataset_id: UUID) -> str:
+def _relative_tile_path(dataset_id: UUID, db: SessionRepository | None = None) -> str:
+    if db is not None and getattr(db, "_legacy_engine", None) is None and hasattr(db, "get_dataset_dir"):
+        td = _tile_directory(dataset_id, db)
+        try:
+            return td.relative_to(BACKEND_DIRECTORY).as_posix()
+        except ValueError:
+            return td.as_posix()
     return (Path("storage") / "tiles" / str(dataset_id)).as_posix()
 
 
-def _tile_directory(dataset_id: UUID) -> Path:
+def _tile_directory(dataset_id: UUID, db: SessionRepository | None = None) -> Path:
+    if db is not None and getattr(db, "_legacy_engine", None) is None and hasattr(db, "get_dataset_dir"):
+        td = db.get_dataset_dir(dataset_id) / "tiles"
+        td.mkdir(parents=True, exist_ok=True)
+        return td
     return TILES_DIRECTORY / str(dataset_id)
 
 
-def _temporary_tile_directory(dataset_id: UUID) -> Path:
+def _temporary_tile_directory(dataset_id: UUID, db: SessionRepository | None = None) -> Path:
+    if db is not None and getattr(db, "_legacy_engine", None) is None and hasattr(db, "get_dataset_dir"):
+        td = db.get_dataset_dir(dataset_id) / "tiles_temp"
+        td.mkdir(parents=True, exist_ok=True)
+        return td
     return TILES_DIRECTORY / f"{dataset_id}_temp"
 
 
@@ -419,13 +438,13 @@ def _response(
 
 def generate_tiles(
     request: TileGenerationRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> TileGenerationResponse:
     dataset = _load_dataset(db, request.dataset_id)
     _validate_zoom_range(request.min_zoom, request.max_zoom)
     source_path = _processed_raster_path(dataset)
-    relative_tile_path = _relative_tile_path(request.dataset_id)
-    final_directory = _tile_directory(request.dataset_id)
+    relative_tile_path = _relative_tile_path(request.dataset_id, db)
+    final_directory = _tile_directory(request.dataset_id, db)
 
     with _open_processed_raster(source_path) as source:
         _require_web_mercator(source)
@@ -451,12 +470,22 @@ def generate_tiles(
             min_zoom=None,
             max_zoom=None,
         )
+        effective_max_zoom = request.max_zoom
+        try:
+            res_val = min(abs(source.transform.a), abs(source.transform.e))
+            if res_val > 0:
+                import math
+                native_zoom = math.ceil(math.log2(156543.03392804097 / res_val))
+                effective_max_zoom = min(request.max_zoom, max(request.min_zoom, native_zoom + 1))
+        except Exception:
+            effective_max_zoom = request.max_zoom
+
         try:
             _generate_tile_set(
                 source,
                 final_directory,
                 min_zoom=request.min_zoom,
-                max_zoom=request.max_zoom,
+                max_zoom=effective_max_zoom,
             )
         except ApplicationError as exc:
             logger.exception("Tile generation failed.", exc_info=exc)
@@ -496,7 +525,7 @@ def generate_tiles(
             status="completed",
             tile_path=relative_tile_path,
             min_zoom=request.min_zoom,
-            max_zoom=request.max_zoom,
+            max_zoom=effective_max_zoom,
         )
     except ApplicationError:
         try:

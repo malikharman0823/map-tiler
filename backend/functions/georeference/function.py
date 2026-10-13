@@ -12,7 +12,8 @@ from rasterio.errors import RasterioError
 from rasterio.transform import Affine, array_bounds
 from rasterio.warp import calculate_default_transform, reproject, Resampling
 
-from database import DatabaseError, DatabaseSession
+from config import settings
+from storage.session import RepositoryError, SessionRepository
 from functions.georeference.request import GeoreferenceRequest
 from functions.georeference.response import (
     GeoreferenceData,
@@ -22,7 +23,7 @@ from functions.georeference.response import (
 )
 from models.control_point import ControlPoint
 from models.dataset import Dataset
-from models.tables import GeoreferenceConfig
+from models.georeference_config import GeoreferenceConfig
 from schemas.error import ApplicationError
 
 
@@ -30,7 +31,7 @@ logger = logging.getLogger(__name__)
 BACKEND_DIRECTORY = Path(__file__).resolve().parents[2]
 UPLOAD_DIRECTORY = BACKEND_DIRECTORY / "storage" / "uploads"
 PROCESSED_DIRECTORY = BACKEND_DIRECTORY / "storage" / "processed"
-SUPPORTED_RASTER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff"}
+SUPPORTED_RASTER_EXTENSIONS = {".jpg", ".jpeg", ".png", ".pdf", ".dxf", ".dwg", ".svf"}
 DEFAULT_TARGET_CRS = "EPSG:4326"
 SOURCE_COORDINATE_SYSTEM = {
     "x": "image_x",
@@ -70,10 +71,10 @@ def _error(
     )
 
 
-def _load_dataset(db: DatabaseSession, dataset_id: UUID) -> Dataset:
+def _load_dataset(db: SessionRepository, dataset_id: UUID) -> Dataset:
     try:
         dataset = db.get_dataset(dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         raise _error(
             500,
@@ -93,11 +94,11 @@ def _load_dataset(db: DatabaseSession, dataset_id: UUID) -> Dataset:
 
 
 def _load_control_points(
-    db: DatabaseSession, dataset_id: UUID
+    db: SessionRepository, dataset_id: UUID
 ) -> list[ControlPoint]:
     try:
         return db.list_control_points(dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         raise _error(
             500,
@@ -143,7 +144,7 @@ def _validate_dataset_format(dataset: Dataset) -> None:
             400,
             "INVALID_SOURCE_IMAGE",
             "This dataset cannot be georeferenced as a raster image.",
-            "Visual georeferencing supports JPG, PNG, and TIFF raster images.",
+            "Visual georeferencing supports PNG, JPG, PDF, CAD (.dxf, .dwg), and SVF files.",
             "dataset_id",
         )
 
@@ -177,17 +178,30 @@ def _validate_count(points: list[ControlPoint]) -> str:
 
 
 def _source_path(dataset: Dataset) -> Path:
-    candidate = (BACKEND_DIRECTORY / dataset.storage_path).resolve()
-    try:
-        candidate.relative_to(UPLOAD_DIRECTORY.resolve())
-    except ValueError as exc:
+    sp = Path(dataset.storage_path)
+    candidate = sp.resolve() if sp.is_absolute() else (BACKEND_DIRECTORY / dataset.storage_path).resolve()
+    sessions_root = Path(settings.session_storage_dir).resolve()
+
+    is_valid = False
+    for safe_root in (UPLOAD_DIRECTORY.resolve(), sessions_root, (BACKEND_DIRECTORY / "temp").resolve()):
+        try:
+            if candidate.is_relative_to(safe_root):
+                is_valid = True
+                break
+        except (ValueError, TypeError):
+            pass
+
+    if not is_valid and candidate.exists() and str(dataset.id) in candidate.parts:
+        is_valid = True
+
+    if not is_valid:
         raise _error(
             400,
             "INVALID_SOURCE_IMAGE",
             "The source raster is unavailable.",
             "The stored source path is not a managed upload.",
             "dataset_id",
-        ) from exc
+        )
     if not candidate.is_file():
         raise _error(
             400,
@@ -196,16 +210,38 @@ def _source_path(dataset: Dataset) -> Path:
             "The uploaded source image could not be found.",
             "dataset_id",
         )
+
+    # For PDF, CAD (DXF, DWG), SVF, resolve the rendered PNG canvas
+    if candidate.suffix.lower() in {".pdf", ".dxf", ".dwg", ".svf"}:
+        preview_path = candidate.parent / "source-preview.png"
+        if not preview_path.is_file():
+            preview_path = PROCESSED_DIRECTORY / str(dataset.id) / "source-preview.png"
+        if not preview_path.is_file():
+            from functions.formats.converters import convert_source_to_image
+            preview_path.parent.mkdir(parents=True, exist_ok=True)
+            convert_source_to_image(candidate, preview_path)
+        return preview_path
+
     return candidate
 
 
-def _relative_output_path(dataset_id: UUID, *, preview: bool = False) -> str:
+def _relative_output_path(dataset_id: UUID, db: SessionRepository | None = None, *, preview: bool = False) -> str:
     filename = "georeference-preview.tif" if preview else "georeferenced.tif"
+    if db is not None and getattr(db, "_legacy_engine", None) is None and hasattr(db, "get_dataset_dir"):
+        out = _output_path(dataset_id, db, preview=preview)
+        try:
+            return out.relative_to(BACKEND_DIRECTORY).as_posix()
+        except ValueError:
+            return out.as_posix()
     return (Path("storage") / "processed" / str(dataset_id) / filename).as_posix()
 
 
-def _output_path(dataset_id: UUID, *, preview: bool = False) -> Path:
+def _output_path(dataset_id: UUID, db: SessionRepository | None = None, *, preview: bool = False) -> Path:
     filename = "georeference-preview.tif" if preview else "georeferenced.tif"
+    if db is not None and getattr(db, "_legacy_engine", None) is None and hasattr(db, "get_dataset_dir"):
+        proc_dir = db.get_dataset_dir(dataset_id) / "processed"
+        proc_dir.mkdir(parents=True, exist_ok=True)
+        return proc_dir / filename
     return PROCESSED_DIRECTORY / str(dataset_id) / filename
 
 
@@ -460,34 +496,19 @@ def _write_raster(
         destination_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_path.unlink(missing_ok=True)
         with rasterio.open(source_path) as source:
-            bounds = array_bounds(source.height, source.width, calculation.raster_transform)
-            transform, width, height = calculate_default_transform(
-                calculation.target_crs,
-                calculation.target_crs,
-                source.width,
-                source.height,
-                *bounds
-            )
             profile = source.profile.copy()
             profile.update(
                 driver="GTiff",
-                width=width,
-                height=height,
+                width=source.width,
+                height=source.height,
                 count=source.count,
                 crs=calculation.target_crs,
-                transform=transform,
+                transform=calculation.raster_transform,
             )
             with rasterio.open(temporary_path, "w", **profile) as destination:
                 for i in range(1, source.count + 1):
-                    reproject(
-                        source=source.read(i),
-                        destination=rasterio.band(destination, i),
-                        src_transform=calculation.raster_transform,
-                        src_crs=calculation.target_crs,
-                        dst_transform=transform,
-                        dst_crs=calculation.target_crs,
-                        resampling=Resampling.nearest
-                    )
+                    destination.write(source.read(i), i)
+        destination_path.unlink(missing_ok=True)
         temporary_path.replace(destination_path)
     except (RasterioError, OSError, TypeError, ValueError) as exc:
         temporary_path.unlink(missing_ok=True)
@@ -535,7 +556,7 @@ def _response_data(
 
 
 def _upsert_config(
-    db: DatabaseSession,
+    db: SessionRepository,
     dataset: Dataset,
     calculation: GeoreferenceCalculation,
     point_count: int,
@@ -573,7 +594,7 @@ def _restore_output(output: Path, backup: Path | None) -> None:
 
 
 def _record_failure(
-    db: DatabaseSession, dataset: Dataset, config: GeoreferenceConfig | None = None
+    db: SessionRepository, dataset: Dataset, config: GeoreferenceConfig | None = None
 ) -> None:
     try:
         db.rollback()
@@ -584,13 +605,13 @@ def _record_failure(
             current.status = "failed"
             db.save_georeference_config(current)
         db.commit()
-    except DatabaseError:
+    except RepositoryError:
         db.rollback()
         logger.exception("Failed to persist georeference failure status.")
 
 
 def mark_georeference_publication_failed(
-    dataset_id: UUID, db: DatabaseSession
+    dataset_id: UUID, db: SessionRepository
 ) -> None:
     """Prevent a partially processed save from appearing on the main map."""
     try:
@@ -608,13 +629,13 @@ def mark_georeference_publication_failed(
             config.status = "failed"
             db.save_georeference_config(config)
         db.commit()
-    except DatabaseError:
+    except RepositoryError:
         db.rollback()
         logger.exception("Failed to mark an incomplete map publication as failed.")
 
 
 def georeference_dataset(
-    request: GeoreferenceRequest, db: DatabaseSession
+    request: GeoreferenceRequest, db: SessionRepository
 ) -> GeoreferenceResponse:
     dataset = _load_dataset(db, request.dataset_id)
     _validate_dataset_format(dataset)
@@ -626,7 +647,7 @@ def georeference_dataset(
     )
 
     if request.action == "calculate":
-        preview_path = _output_path(dataset.id, preview=True)
+        preview_path = _output_path(dataset.id, db, preview=True)
         _write_raster(source_path, preview_path, calculation)
         return GeoreferenceResponse(
             data=_response_data(
@@ -634,15 +655,15 @@ def georeference_dataset(
                 calculation,
                 config=None,
                 status="calculated",
-                output_path=_relative_output_path(dataset.id, preview=True),
+                output_path=_relative_output_path(dataset.id, db, preview=True),
                 point_count=len(points),
                 message="Georeference calculated. Review the preview before saving.",
             )
         )
 
-    candidate = _output_path(dataset.id).with_name("georeferenced.pending.tif")
-    output = _output_path(dataset.id)
-    relative_output = _relative_output_path(dataset.id)
+    candidate = _output_path(dataset.id, db).with_name("georeferenced.pending.tif")
+    output = _output_path(dataset.id, db)
+    relative_output = _relative_output_path(dataset.id, db)
     backup: Path | None = None
     promoted = False
     config: GeoreferenceConfig | None = None
@@ -666,6 +687,7 @@ def georeference_dataset(
         if output.is_file():
             output.replace(backup_path)
             backup = backup_path
+        output.unlink(missing_ok=True)
         candidate.replace(output)
         promoted = True
         db.commit()
@@ -673,7 +695,7 @@ def georeference_dataset(
         candidate.unlink(missing_ok=True)
         _record_failure(db, dataset, config)
         raise
-    except (DatabaseError, OSError) as exc:
+    except (RepositoryError, OSError) as exc:
         candidate.unlink(missing_ok=True)
         if promoted or backup is not None:
             _restore_output(output, backup)
@@ -738,12 +760,12 @@ def _calculation_from_config(config: GeoreferenceConfig) -> GeoreferenceCalculat
 
 
 def get_georeference_config(
-    dataset_id: UUID, db: DatabaseSession
+    dataset_id: UUID, db: SessionRepository
 ) -> GeoreferenceLookupResponse:
     dataset = _load_dataset(db, dataset_id)
     try:
         config = db.get_active_georeference_config(dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         raise _error(
             500,
@@ -778,7 +800,7 @@ def get_georeference_config(
                 message=(
                     "Saved georeference configuration is ready to reuse."
                     if reusable
-                    else warning
+                    else REUSE_WARNING
                 ),
             )
         )

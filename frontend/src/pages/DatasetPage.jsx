@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react"
+import React, { useEffect, useMemo, useState } from "react"
 import { Link, useNavigate, useParams } from "react-router-dom"
 import {
   createIconPoint,
@@ -21,44 +21,34 @@ import {
 import DatasetInspectionPanel from "../components/DatasetInspectionPanel"
 import Map from "../components/Map"
 import { displayName } from "../components/DatasetCard"
-
-const EXPORT_OPTIONS = [
-  { 
-    format: "mtmap", 
-    label: "FULL PROJECT", 
-    detail: ".mtmap",
-    description: "Complete editable MapTiler Clone project.",
-    contains: ["datasets", "georeferencing", "control points", "user points", "icons", "layers", "map position", "styling", "generated tiles"],
-    bestFor: "Reopening and continuing work in MapTiler Clone.",
-    canDisplay: ["raster", "vector layers", "georeferenced raster", "user points", "control points", "icons", "generated tiles", "layer configuration", "map camera", "styling"],
-    doesNotPreserve: []
-  },
-  { 
-    format: "tif", 
-    label: "GEOTIFF", 
-    detail: ".tif",
-    description: "Georeferenced raster.",
-    contains: ["raster pixels", "CRS", "geographic transform", "geographic bounds"],
-    bestFor: "Floor plans, scanned maps, imagery and GIS applications.",
-    canDisplay: ["raster", "geographic positioning"],
-    doesNotPreserve: ["user points", "control-point editing state", "project UI configuration"]
-  },
-  { 
-    format: "mbtiles", 
-    label: "CUSTOM TILES", 
-    detail: ".mbtiles",
-    description: "Generated map tile package.",
-    contains: ["generated map tiles", "tile metadata", "zoom information"],
-    bestFor: "Using generated custom tiles in compatible mapping/tile applications.",
-    canDisplay: ["map tiles"],
-    doesNotPreserve: ["complete project", "control-point configuration", "user-point database", "application-specific layer settings"]
-  },
-]
+import DatasetMetadataOverlay from "../components/DatasetMetadataOverlay"
+import { Button } from "@/components/ui/button"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import {
+  Layers,
+  Save,
+  Download,
+  Compass,
+  Trash2,
+  Menu,
+  ChevronRight,
+  Loader2,
+  AlertCircle,
+} from "lucide-react"
+import EndSessionDialog from "../components/EndSessionDialog"
 
 export default function DatasetPage() {
   const { id } = useParams()
   const navigate = useNavigate()
-  const exportMenuRef = useRef(null)
   const [dataset, setDataset] = useState(null)
   const [project, setProject] = useState(null)
   const [points, setPoints] = useState([])
@@ -66,8 +56,9 @@ export default function DatasetPage() {
   const [icons, setIcons] = useState([])
   const [loading, setLoading] = useState(true)
   const [deleting, setDeleting] = useState(false)
+  const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [saving, setSaving] = useState(false)
-  const [exportState, setExportState] = useState("closed")
+  const [exportState, setExportState] = useState("idle")
   const [exportStatus, setExportStatus] = useState(null)
   const [error, setError] = useState(null)
   const [controlPointsError, setControlPointsError] = useState(null)
@@ -110,7 +101,7 @@ export default function DatasetPage() {
     setIconPointsError(null)
     setPbfPreview(null)
     setPbfError(null)
-    setExportState("closed")
+    setExportState("idle")
     setExportStatus(null)
     setPanelOpen(window.matchMedia("(min-width: 736px)").matches)
 
@@ -192,22 +183,6 @@ export default function DatasetPage() {
     }
   }, [id, isPbf, isVectorSource])
 
-  useEffect(() => {
-    if (exportState !== "open") return undefined
-    function closeOnOutsideClick(event) {
-      if (!exportMenuRef.current?.contains(event.target)) setExportState("closed")
-    }
-    function closeOnEscape(event) {
-      if (event.key === "Escape") setExportState("closed")
-    }
-    document.addEventListener("pointerdown", closeOnOutsideClick)
-    document.addEventListener("keydown", closeOnEscape)
-    return () => {
-      document.removeEventListener("pointerdown", closeOnOutsideClick)
-      document.removeEventListener("keydown", closeOnEscape)
-    }
-  }, [exportState])
-
   const isMbtiles = datasetFormat === "mbtiles" || Boolean(dataset?.metadata?.mbtiles_path)
   const isVectorMbtiles = isMbtiles && ["pbf", "mvt"].includes(dataset?.metadata?.tile_format)
   const tileUrl = useMemo(
@@ -218,7 +193,6 @@ export default function DatasetPage() {
   )
 
   async function removeDataset() {
-    if (!window.confirm("Delete this dataset and all of its stored files?")) return
     setDeleting(true)
     setError(null)
     try {
@@ -227,6 +201,7 @@ export default function DatasetPage() {
     } catch (requestError) {
       setError(readableApiError(requestError, "Unable to delete the dataset."))
       setDeleting(false)
+      setShowDeleteDialog(false)
     }
   }
 
@@ -240,7 +215,6 @@ export default function DatasetPage() {
       }
       const updated = await updateMapProject(id, project?.name || dataset?.filename || "Map Project", config)
       setProject(updated)
-      await handleExport("mtmap", updated.name)
     } catch (requestError) {
       const readable = readableApiError(requestError, "Unable to save the project.")
       setExportState("error")
@@ -250,17 +224,17 @@ export default function DatasetPage() {
     }
   }
 
-  async function handleExport(format, projectName = project?.name || dataset?.filename) {
+  async function handleExport() {
     if (exportState === "exporting") return
     setExportState("exporting")
-    setExportStatus({ message: `Preparing ${format.toUpperCase()} export…`, details: "" })
+    setExportStatus({ message: "Preparing MapTiler folder package…", details: "" })
     try {
-      const filename = await downloadProjectExport(id, format, projectName)
+      const filename = await downloadProjectExport(id, project?.name || dataset?.filename)
       setExportState("success")
       setExportStatus({ message: "Export ready", details: filename })
     } catch (requestError) {
       setExportState("error")
-      setExportStatus(readableApiError(requestError, `Unable to export ${format.toUpperCase()}.`))
+      setExportStatus(readableApiError(requestError, "Unable to export the MapTiler folder package."))
     }
   }
 
@@ -420,11 +394,18 @@ export default function DatasetPage() {
 
   if (!dataset) {
     return (
-      <main className="min-h-screen bg-parchment px-5 py-20">
-        <div className="mx-auto max-w-2xl bg-white border border-red-200 rounded-lg p-6 text-center" role="alert">
-          <p className="font-semibold text-ink">{error?.message || "Dataset unavailable"}</p>
-          <p className="mt-2 text-sm text-muted">{error?.details}</p>
-          <Link className="inline-block mt-5 text-ink hover:text-ink/80" to="/">Back to datasets</Link>
+      <main className="min-h-screen bg-[#f5f5f7] px-5 py-24 flex items-center justify-center">
+        <div className="max-w-md w-full bg-[#ffffff] border border-[#e0e0e0] rounded-[18px] p-8 text-center shadow-xs" role="alert">
+          <div className="w-12 h-12 rounded-full bg-[#ff3b30]/10 text-[#ff3b30] flex items-center justify-center mx-auto mb-4">
+            <AlertCircle className="size-6" />
+          </div>
+          <p className="font-semibold text-[#1d1d1f] text-base">{error?.message || "Dataset unavailable"}</p>
+          <p className="mt-2 text-xs text-[#7a7a7a] leading-relaxed">{error?.details}</p>
+          <div className="mt-6">
+            <Link className="inline-flex min-h-10 items-center justify-center rounded-full bg-[#0066cc] px-6 py-2 text-xs font-normal text-white hover:bg-[#0071e3] transition-colors" to="/">
+              Back to datasets
+            </Link>
+          </div>
         </div>
       </main>
     )
@@ -448,63 +429,104 @@ export default function DatasetPage() {
   const datasetLayerName = displayName(savedMapLayer?.name || dataset.filename)
 
   return (
-    <div className="bg-parchment text-ink font-sans antialiased h-screen overflow-hidden flex flex-col">
+    <div className="bg-[#f5f5f7] text-[#1d1d1f] font-sans antialiased h-screen overflow-hidden flex flex-col">
       {/* Top App Navigation */}
-      <header className="shrink-0 h-12 bg-white/90 backdrop-blur border-b border-hairline z-50 flex items-center justify-between px-3">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2 pr-3 border-r border-hairline">
-            <span className="material-symbols-outlined text-ink text-[18px]">layers</span>
-            <span className="text-xs font-semibold tracking-tight text-ink">MapTiler Studio</span>
-            <span className="text-[10px] px-1.5 py-0.5 bg-pearl text-muted rounded font-mono">MVP</span>
-          </div>
+      <header className="shrink-0 h-14 bg-[#ffffff]/90 backdrop-blur-md border-b border-[#e0e0e0] z-50 flex items-center justify-between px-3 sm:px-6">
+        <div className="flex items-center gap-3 min-w-0">
+          <Link to="/" className="flex items-center gap-2 group shrink-0">
+            <div className="size-7 rounded-lg bg-[#0066cc] text-white flex items-center justify-center font-bold shadow-xs transition-transform group-hover:scale-105">
+              <Layers className="size-4" />
+            </div>
+            <span className="text-xs font-semibold tracking-tight text-[#1d1d1f] hidden sm:inline">
+              MapTiler Studio
+            </span>
+          </Link>
+          <div className="h-4 w-px bg-[#e0e0e0] hidden sm:block"></div>
           {/* Breadcrumbs */}
-          <nav className="flex items-center gap-1.5 text-xs text-muted">
-            <Link className="hover:text-ink transition-colors" to="/">Datasets</Link>
-            <span className="text-muted/60">/</span>
-            <span className="text-ink font-medium truncate max-w-[200px]">{displayName(dataset.filename)}</span>
-            <span className="text-[11px] font-mono px-1.5 py-0.5 rounded bg-pearl border border-hairline text-muted ml-1">{metadata.crs || "Unknown"}</span>
+          <nav className="flex items-center gap-1.5 text-xs text-[#7a7a7a] min-w-0">
+            <Link className="hover:text-[#0066cc] transition-colors shrink-0" to="/">
+              Datasets
+            </Link>
+            <ChevronRight className="size-3 text-[#7a7a7a] shrink-0" />
+            <span className="text-[#1d1d1f] font-semibold truncate max-w-[120px] sm:max-w-[240px]">
+              {displayName(dataset.filename)}
+            </span>
+            <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-[#f5f5f7] border border-[#e0e0e0] text-[#7a7a7a] shrink-0 ml-1">
+              {metadata.crs || "Unknown"}
+            </span>
           </nav>
         </div>
 
         {/* Right Header Actions */}
-        <div className="flex items-center gap-1.5">
-          <button 
-            onClick={handleSaveProject} 
+        <div className="flex items-center gap-2 shrink-0">
+          <Button
+            variant="pill"
+            size="sm"
+            onClick={handleSaveProject}
             disabled={saving}
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md bg-blue-50 hover:bg-blue-100 border border-blue-200 text-blue-600 hover:text-blue-700 transition-colors"
+            className="h-8 bg-[#0066cc] hover:bg-[#0071e3] text-white text-xs font-normal"
           >
-            <span className="material-symbols-outlined text-[15px]">save</span>
-            <span>{saving ? "Saving..." : "Save Project"}</span>
-          </button>
-          
-          <button
+            {saving ? (
+              <Loader2 className="size-3.5 mr-1 animate-spin" />
+            ) : (
+              <Save className="size-3.5 mr-1" />
+            )}
+            <span className="hidden sm:inline">{saving ? "Saving…" : "Save Project"}</span>
+            <span className="sm:hidden">Save</span>
+          </Button>
+
+          <Button
             type="button"
+            variant="outline"
+            size="sm"
             disabled={exportState === "exporting" || saving}
-            onClick={() => setExportState("open")}
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md bg-white hover:bg-pearl border border-hairline text-ink hover:text-ink/80 transition-colors disabled:opacity-60 disabled:cursor-not-allowed"
+            onClick={handleExport}
+            className="h-8 rounded-full border-[#e0e0e0] text-xs text-[#1d1d1f] bg-[#ffffff] hover:bg-[#fafafc]"
           >
-            <span className="material-symbols-outlined text-[15px]">download</span>
-            <span>{exportState === "exporting" ? "Exporting…" : "Export"}</span>
-          </button>
-          
+            {exportState === "exporting" ? (
+              <Loader2 className="size-3.5 mr-1 animate-spin text-[#0066cc]" />
+            ) : (
+              <Download className="size-3.5 mr-1 text-[#7a7a7a]" />
+            )}
+            <span className="hidden sm:inline">
+              {exportState === "exporting" ? "Exporting…" : "Export"}
+            </span>
+            <span className="sm:hidden">Export</span>
+          </Button>
+
           {canGeoreference && (
-            <Link to={`/datasets/${id}/georeference`} className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md bg-white hover:bg-pearl border border-hairline text-ink hover:text-ink/80 transition-colors ml-2 border-l border-hairline pl-3">
-              <span className="material-symbols-outlined text-[15px]">satellite_alt</span>
-              <span>{dataset.georeference ? "Edit Georef" : "Georeference"}</span>
-            </Link>
+            <Button
+              asChild
+              variant="outline"
+              size="sm"
+              className="h-8 rounded-full border-[#e0e0e0] text-xs text-[#1d1d1f] bg-[#ffffff] hover:bg-[#fafafc]"
+            >
+              <Link to={`/datasets/${id}/georeference`}>
+                <Compass className="size-3.5 mr-1 text-[#0066cc]" />
+                <span className="hidden sm:inline">
+                  {dataset.georeference ? "Edit Georef" : "Georeference"}
+                </span>
+                <span className="sm:hidden">Georef</span>
+              </Link>
+            </Button>
           )}
-          <button 
-            onClick={removeDataset} 
+
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setShowDeleteDialog(true)}
             disabled={deleting}
-            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md bg-red-50 hover:bg-red-100 border border-red-200 text-red-600 hover:text-red-700 transition-colors ml-1"
+            className="size-8 rounded-full text-[#7a7a7a] hover:text-[#ff3b30] hover:bg-[#ff3b30]/10"
+            title="Delete dataset"
           >
-            <span className="material-symbols-outlined text-[15px]">delete</span>
-            <span>{deleting ? "Deleting..." : "Delete"}</span>
-          </button>
+            <Trash2 className="size-4" />
+          </Button>
+
+          <EndSessionDialog />
         </div>
       </header>
 
-      {exportStatus && exportState !== "closed" && exportState !== "open" && (
+      {exportStatus && (
         <div
           role={exportState === "error" ? "alert" : "status"}
           aria-live="polite"
@@ -513,7 +535,7 @@ export default function DatasetPage() {
           <p className="font-semibold">{exportStatus.message}</p>
           {exportStatus.details && <p className="mt-1 text-muted">{exportStatus.details}</p>}
           {exportState !== "exporting" && (
-            <button type="button" className="mt-2 text-ink underline" onClick={() => { setExportState("closed"); setExportStatus(null) }}>Dismiss</button>
+            <button type="button" className="mt-2 text-ink underline" onClick={() => { setExportState("idle"); setExportStatus(null) }}>Dismiss</button>
           )}
         </div>
       )}
@@ -522,6 +544,7 @@ export default function DatasetPage() {
       <main className="flex-1 flex min-h-0 relative">
         {/* Central Map Canvas */}
         <div className="relative flex-1 h-full overflow-hidden bg-[#e6e8eb]">
+          <DatasetMetadataOverlay dataset={dataset} />
           <Map
             key={id}
             tileUrl={tileUrl}
@@ -570,12 +593,13 @@ export default function DatasetPage() {
           )}
 
           {!panelOpen && (
-            <button 
-              type="button" 
-              className="absolute right-4 top-4 z-10 w-8 h-8 rounded-md bg-white border border-hairline flex items-center justify-center text-ink shadow-sm hover:bg-pearl" 
+            <button
+              type="button"
+              className="absolute right-4 top-4 z-10 w-9 h-9 rounded-full bg-white border border-hairline flex items-center justify-center text-ink shadow-sm hover:bg-pearl"
               onClick={() => setPanelOpen(true)}
+              title="Open inspector"
             >
-              <span className="material-symbols-outlined text-[18px]">menu_open</span>
+              <Menu className="size-4 text-ink" />
             </button>
           )}
 
@@ -625,114 +649,47 @@ export default function DatasetPage() {
         />
       </main>
 
-      {/* Export Modal */}
-      {exportState === "open" && (
-        <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/40 backdrop-blur-sm p-4 overflow-y-auto">
-          <div 
-            ref={exportMenuRef}
-            className="bg-white rounded-xl shadow-2xl w-full max-w-4xl max-h-[90vh] flex flex-col"
-          >
-            <div className="flex items-center justify-between px-6 py-4 border-b border-hairline">
-              <div>
-                <h2 className="text-lg font-semibold text-ink">Export Map</h2>
-                <p className="text-sm text-muted mt-1">Choose the format based on what you want to preserve or use outside the application.</p>
-              </div>
-              <button 
-                onClick={() => setExportState("closed")}
-                className="w-8 h-8 flex items-center justify-center rounded-full hover:bg-pearl text-muted hover:text-ink transition-colors"
-              >
-                <span className="material-symbols-outlined text-[20px]">close</span>
-              </button>
-            </div>
-            
-            <div className="flex-1 overflow-y-auto p-6">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-                {EXPORT_OPTIONS.filter((option) => {
-                  if (option.format === "tif") {
-                    return dataset.georeferenced_path || dataset.processed_path || /\.tiff?$/i.test(dataset.filename);
-                  }
-                  if (option.format === "mbtiles") {
-                    return dataset.tile_status === "completed" || dataset.metadata?.format === "mbtiles" || Boolean(dataset.metadata?.mbtiles_path);
-                  }
-                  return true;
-                }).map((option) => (
-                  <div key={option.format} className="flex flex-col border border-hairline rounded-lg overflow-hidden bg-pearl/30">
-                    <div className="p-5 flex-1 flex flex-col">
-                      <div className="flex items-center justify-between mb-2">
-                        <h3 className="font-bold text-ink">{option.label}</h3>
-                        <span className="font-mono text-xs text-muted bg-white px-1.5 py-0.5 rounded border border-hairline">{option.detail}</span>
-                      </div>
-                      
-                      <p className="text-sm font-medium text-ink mb-4">{option.description}</p>
-                      
-                      {option.contains?.length > 0 && (
-                        <div className="mb-4">
-                          <h4 className="text-[11px] font-semibold text-muted uppercase tracking-wider mb-1">Contains</h4>
-                          <ul className="text-xs text-ink space-y-1">
-                            {option.contains.map(item => (
-                              <li key={item} className="flex items-start gap-1.5">
-                                <span className="w-1 h-1 rounded-full bg-ink/30 mt-1.5 shrink-0"></span>
-                                <span>{item}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                      
-                      <div className="mb-4">
-                        <h4 className="text-[11px] font-semibold text-muted uppercase tracking-wider mb-1">Best for</h4>
-                        <p className="text-xs text-ink">{option.bestFor}</p>
-                      </div>
-                      
-                      {option.canDisplay?.length > 0 && (
-                        <div className="mb-4">
-                          <h4 className="text-[11px] font-semibold text-muted uppercase tracking-wider mb-1">Can display</h4>
-                          <ul className="text-xs text-green-700 space-y-1">
-                            {option.canDisplay.map(item => (
-                              <li key={item} className="flex items-start gap-1.5">
-                                <span className="material-symbols-outlined text-[14px]">check</span>
-                                <span>{item}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                      
-                      {option.doesNotPreserve?.length > 0 && (
-                        <div className="mb-4">
-                          <h4 className="text-[11px] font-semibold text-muted uppercase tracking-wider mb-1">Does not preserve</h4>
-                          <ul className="text-xs text-red-600 space-y-1">
-                            {option.doesNotPreserve.map(item => (
-                              <li key={item} className="flex items-start gap-1.5">
-                                <span className="material-symbols-outlined text-[14px]">close</span>
-                                <span>{item}</span>
-                              </li>
-                            ))}
-                          </ul>
-                        </div>
-                      )}
-                    </div>
-                    
-                    <div className="p-4 border-t border-hairline bg-white mt-auto">
-                      <button
-                        onClick={() => {
-                          setExportState("closed") // close popup on export action 
-                          handleExport(option.format)
-                        }}
-                        disabled={exportState === "exporting"}
-                        className="w-full py-2 px-4 bg-blue-600 hover:bg-blue-700 text-white font-medium rounded-md shadow-sm transition-colors text-sm flex items-center justify-center gap-2"
-                      >
-                        <span className="material-symbols-outlined text-[16px]">download</span>
-                        Export {option.detail}
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+      <AlertDialog
+        open={showDeleteDialog}
+        onOpenChange={(open) => !open && setShowDeleteDialog(false)}
+      >
+        <AlertDialogContent className="rounded-[20px] bg-[#ffffff] border border-[#e0e0e0] text-[#1d1d1f] shadow-lg max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-base font-semibold text-[#1d1d1f]">
+              Delete Dataset?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-xs text-[#7a7a7a] mt-1.5">
+              Are you sure you want to delete{" "}
+              <strong className="text-[#1d1d1f]">
+                {displayName(dataset?.filename || "")}
+              </strong>
+              ? This action will permanently remove all associated spatial tiles, pyramids, and metadata.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="mt-4 gap-2">
+            <AlertDialogCancel
+              disabled={deleting}
+              className="rounded-full border-[#e0e0e0] bg-[#ffffff] hover:bg-[#f5f5f7] text-xs text-[#1d1d1f]"
+            >
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={removeDataset}
+              disabled={deleting}
+              className="rounded-full bg-[#ff3b30] hover:bg-[#e03126] text-white text-xs font-normal"
+            >
+              {deleting ? (
+                <>
+                  <Loader2 className="size-3.5 mr-1.5 animate-spin" />
+                  <span>Deleting…</span>
+                </>
+              ) : (
+                <span>Delete Permanently</span>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

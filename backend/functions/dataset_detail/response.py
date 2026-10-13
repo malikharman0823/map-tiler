@@ -53,6 +53,9 @@ class DatasetDetailData(BaseModel):
     tile_min_zoom: int | None
     tile_max_zoom: int | None
     tile_status: str
+    display_type: str | None = None
+    is_spatial: bool = False
+    is_georeferenced: bool = False
     georeference: GeoreferenceSummary | None = None
     map_layer: MapLayerSummary | None = None
     created_at: datetime

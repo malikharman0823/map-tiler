@@ -10,7 +10,7 @@ from rasterio.enums import Resampling
 from rasterio.errors import RasterioError
 from rasterio.warp import transform_bounds
 
-from database import DatabaseError, DatabaseSession
+from storage.session import RepositoryError, SessionRepository
 
 from functions.dataset_detail.request import DatasetDetailRequest
 from functions.dataset_detail.response import (
@@ -20,6 +20,7 @@ from functions.dataset_detail.response import (
     GeoreferenceSummary,
     MapLayerSummary,
 )
+from config import settings
 from models.dataset import Dataset
 from schemas.error import ApplicationError
 
@@ -77,8 +78,17 @@ def _managed_path(
             field="dataset_id",
         )
     try:
-        candidate = (BACKEND_DIRECTORY / stored_path).resolve()
-        candidate.relative_to(expected_directory.resolve())
+        stored = Path(stored_path)
+        candidate = stored.resolve() if stored.is_absolute() else (BACKEND_DIRECTORY / stored).resolve()
+        sessions_root = Path(settings.session_storage_dir).resolve()
+        is_safe = (
+            candidate.is_relative_to(expected_directory.resolve())
+            or candidate.is_relative_to(sessions_root)
+            or candidate.is_relative_to(BACKEND_DIRECTORY.resolve())
+            or (candidate.exists() and any(p in ("sessions", "datasets") for p in candidate.parts))
+        )
+        if not is_safe:
+            raise ValueError("Path traversal detected")
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise ApplicationError(
             status_code=404,
@@ -167,13 +177,68 @@ def _tile_directory(dataset: Dataset) -> Path:
     return candidate
 
 
+def _is_folder_tile_dataset(dataset: Dataset) -> bool:
+    metadata = dataset.extracted_metadata or {}
+    if str(metadata.get("format") or "").lower() == "mapstudio_folder":
+        return True
+    return bool(
+        metadata.get("import_package_hash")
+        and isinstance(metadata.get("bounds"), list)
+        and dataset.tile_status == "completed"
+        and dataset.tile_path
+    )
+
+
 def _map_layer(dataset: Dataset, georeference) -> MapLayerSummary | None:
-    if (
-        georeference is None
-        or georeference.status != "completed"
-        or dataset.georeference_status != "completed"
-    ):
+    metadata = dataset.extracted_metadata or {}
+    if _is_folder_tile_dataset(dataset):
+        bounds_value = metadata.get("bounds")
+        if not isinstance(bounds_value, list) or len(bounds_value) != 4:
+            raise ApplicationError(
+                status_code=404,
+                code="RASTER_OUTPUT_NOT_FOUND",
+                message="The restored project map bounds were not found.",
+                details="Open the original exported folder again.",
+                field="dataset_id",
+            )
+        west, south, east, north = (float(value) for value in bounds_value)
+        if (
+            dataset.tile_status != "completed"
+            or dataset.tile_min_zoom is None
+            or dataset.tile_max_zoom is None
+            or not (-180 <= west < east <= 180 and -90 <= south < north <= 90)
+        ):
+            raise ApplicationError(
+                status_code=404,
+                code="TILE_SOURCE_NOT_FOUND",
+                message="The restored project tile source was not found.",
+                details="Open the original exported folder again.",
+                field="dataset_id",
+            )
+        _tile_directory(dataset)
+        return MapLayerSummary(
+            name=Path(dataset.filename).stem,
+            source_crs="EPSG:3857",
+            bounds=GeographicBounds(
+                min_longitude=west,
+                min_latitude=south,
+                max_longitude=east,
+                max_latitude=north,
+            ),
+            tile_url_template=f"/datasets/{dataset.id}/tiles/{{z}}/{{x}}/{{y}}.png",
+            tile_min_zoom=dataset.tile_min_zoom,
+            tile_max_zoom=dataset.tile_max_zoom,
+        )
+
+    if dataset.georeference_status != "completed":
         return None
+
+    if georeference is None and not dataset.processed_path:
+        return None
+
+    if georeference and georeference.status != "completed":
+        return None
+
     if (
         dataset.tile_status != "completed"
         or dataset.tile_min_zoom is None
@@ -187,7 +252,11 @@ def _map_layer(dataset: Dataset, georeference) -> MapLayerSummary | None:
             field="dataset_id",
         )
 
-    source_crs, bounds = _raster_bounds(dataset, georeference.output_path)
+    output_path = georeference.output_path if georeference else dataset.processed_path
+    if not output_path:
+        return None
+
+    source_crs, bounds = _raster_bounds(dataset, output_path)
     _tile_directory(dataset)
     return MapLayerSummary(
         name=Path(dataset.filename).stem,
@@ -200,6 +269,30 @@ def _map_layer(dataset: Dataset, georeference) -> MapLayerSummary | None:
 
 
 def _response(dataset: Dataset, georeference) -> DatasetDetailResponse:
+    metadata = dataset.extracted_metadata or {}
+    format_type = str(metadata.get("format", "")).lower()
+
+    is_georeferenced = False
+    display_type = "unknown"
+    is_spatial = False
+
+    if _is_folder_tile_dataset(dataset):
+        display_type = "raster"
+        is_spatial = True
+        is_georeferenced = True
+    elif format_type in {"jpg", "jpeg", "png"}:
+        display_type = "raster"
+        if dataset.georeference_status == "completed" or (metadata.get("crs") and metadata.get("transform")):
+            is_georeferenced = True
+            is_spatial = True
+    elif format_type in {"pdf", "cad", "dxf", "dwg", "svf"}:
+        display_type = "raster"
+        if dataset.georeference_status == "completed":
+            is_georeferenced = True
+            is_spatial = True
+    elif format_type == "mtmap":
+        display_type = "project"
+
     return DatasetDetailResponse(
         data=DatasetDetailData(
             id=dataset.id,
@@ -217,6 +310,9 @@ def _response(dataset: Dataset, georeference) -> DatasetDetailResponse:
             tile_min_zoom=dataset.tile_min_zoom,
             tile_max_zoom=dataset.tile_max_zoom,
             tile_status=dataset.tile_status,
+            display_type=display_type,
+            is_spatial=is_spatial,
+            is_georeferenced=is_georeferenced,
             georeference=(
                 None
                 if georeference is None
@@ -240,12 +336,12 @@ def _response(dataset: Dataset, georeference) -> DatasetDetailResponse:
 
 def get_dataset_detail(
     request: DatasetDetailRequest,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> DatasetDetailResponse:
     try:
         dataset = db.get_dataset(request.dataset_id)
         georeference = db.get_active_georeference_config(request.dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to retrieve a dataset.", exc_info=exc)
         raise _database_error() from exc
@@ -257,8 +353,17 @@ def get_dataset_detail(
 
 def _source_file_path(dataset: Dataset) -> Path:
     try:
-        source_path = (BACKEND_DIRECTORY / dataset.storage_path).resolve()
-        source_path.relative_to(UPLOAD_DIRECTORY.resolve())
+        stored = Path(dataset.storage_path)
+        source_path = stored.resolve() if stored.is_absolute() else (BACKEND_DIRECTORY / dataset.storage_path).resolve()
+        sessions_root = Path(settings.session_storage_dir).resolve()
+        uploads_root = UPLOAD_DIRECTORY.resolve()
+        is_safe = (
+            source_path.is_relative_to(uploads_root)
+            or source_path.is_relative_to(sessions_root)
+            or (source_path.exists() and any(p in ("sessions", "datasets", "uploads") for p in source_path.parts))
+        )
+        if not is_safe:
+            raise ValueError("Path traversal detected")
     except (OSError, RuntimeError, ValueError) as exc:
         raise ApplicationError(
             status_code=404,
@@ -347,11 +452,11 @@ def _tiff_preview(source_path: Path, dataset_id: UUID) -> Path:
 
 def get_dataset_source_image(
     dataset_id: UUID,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> DatasetSourceImage:
     try:
         dataset = db.get_dataset(dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to retrieve a dataset source image.", exc_info=exc)
         raise _database_error() from exc
@@ -364,6 +469,18 @@ def get_dataset_source_image(
             path=source_path,
             media_type="image/jpeg" if extension in {".jpg", ".jpeg"} else "image/png",
         )
+    if extension in {".pdf", ".dxf", ".dwg", ".svf"}:
+        preview_path = source_path.parent / "source-preview.png"
+        if not preview_path.is_file():
+            preview_path = PROCESSED_DIRECTORY / str(dataset_id) / "source-preview.png"
+        if not preview_path.is_file():
+            from functions.formats.converters import convert_source_to_image
+            preview_path.parent.mkdir(parents=True, exist_ok=True)
+            convert_source_to_image(source_path, preview_path)
+        return DatasetSourceImage(
+            path=preview_path,
+            media_type="image/png",
+        )
     if extension in TIFF_EXTENSIONS:
         return DatasetSourceImage(
             path=_tiff_preview(source_path, dataset_id),
@@ -373,6 +490,6 @@ def get_dataset_source_image(
         status_code=400,
         code="INVALID_RASTER",
         message="The source raster could not be displayed.",
-        details="Visual georeferencing supports JPG, PNG, and TIFF raster images.",
+        details="Visual georeferencing supports PNG, JPG, PDF, CAD (.dxf, .dwg), and SVF files.",
         field="dataset_id",
     )

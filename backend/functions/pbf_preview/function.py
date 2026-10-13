@@ -8,7 +8,7 @@ from uuid import UUID
 import osmium
 from starlette.concurrency import run_in_threadpool
 
-from database import DatabaseError, DatabaseSession
+from storage.session import RepositoryError, SessionRepository
 from functions.pbf_preview.response import PbfPreviewData, PbfPreviewResponse
 from schemas.error import ApplicationError
 
@@ -256,10 +256,10 @@ def _dataset_not_found() -> ApplicationError:
     )
 
 
-def _load_pbf_path(dataset_id: UUID, db: DatabaseSession) -> Path:
+def _load_pbf_path(dataset_id: UUID, db: SessionRepository) -> Path:
     try:
         dataset = db.get_dataset(dataset_id)
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         raise ApplicationError(
             status_code=500,
@@ -293,7 +293,7 @@ def _load_pbf_path(dataset_id: UUID, db: DatabaseSession) -> Path:
 
 async def get_pbf_preview(
     dataset_id: UUID,
-    db: DatabaseSession,
+    db: SessionRepository,
 ) -> PbfPreviewResponse:
     file_path = _load_pbf_path(dataset_id, db)
     try:

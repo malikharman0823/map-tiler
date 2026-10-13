@@ -1,7 +1,7 @@
 import logging
 import math
 from pathlib import Path
-from typing import Any, BinaryIO
+from typing import Any, BinaryIO, IO
 import xml.etree.ElementTree as ElementTree
 from zipfile import BadZipFile, ZipFile
 
@@ -188,7 +188,7 @@ def _update_coordinate_bounds(
     return updated_bounds
 
 
-def _parse_kml_stream(stream: BinaryIO) -> dict[str, Any]:
+def _parse_kml_stream(stream: IO[bytes]) -> dict[str, Any]:
     feature_count = 0
     geometry_types: set[str] = set()
     coordinate_bounds: list[float] | None = None
@@ -400,44 +400,42 @@ def _extract_metadata(request: MetadataRequest) -> MetadataResponse:
     normalized_format = request.format.lower()
     detected_format = normalized_format
     detected_category = request.category
-    if normalized_format in RASTER_FORMATS:
+
+    if normalized_format in {"jpg", "jpeg", "png"}:
         metadata = _extract_raster_metadata(file_path)
-    elif normalized_format in {"geojson", "json"}:
-        document = read_json_document(file_path)
-        detected_format = classify_json_document(
-            document,
-            require_geojson=normalized_format == "geojson",
-        )
-        if detected_format == "geojson":
-            detected_category = "vector"
-            metadata = geojson_metadata(document, file_path.stat().st_size)
-        else:
-            detected_category = "style"
-            metadata = {
-                "file_size": file_path.stat().st_size,
-                "style_version": 8,
-                "source_count": len(document["sources"]),
-                "layer_count": len(document["layers"]),
-                "style": document,
-                "crs": "EPSG:3857",
-                "bounds": None,
-            }
-    elif normalized_format == "geopackage":
-        metadata = inspect_geopackage(file_path)
-    elif normalized_format == "mbtiles":
-        metadata = mbtiles_metadata(file_path)
-    elif normalized_format in KML_FORMATS:
-        metadata = _extract_kml_metadata(file_path, normalized_format)
-    elif normalized_format == "shapefile":
-        metadata = _extract_shapefile_metadata(file_path)
-    elif normalized_format in OSM_FORMATS:
-        metadata = _extract_osm_metadata(file_path, normalized_format)
+    elif normalized_format in {"pdf", "cad", "dxf", "dwg", "svf"}:
+        from functions.formats.converters import convert_source_to_image
+        preview_path = file_path.parent / "source-preview.png"
+        try:
+            width, height = convert_source_to_image(file_path, preview_path)
+        except Exception as exc:
+            logger.warning(f"Could not render image preview for {file_path.name}: {exc}")
+            width, height = 2000, 1500
+
+        metadata = {
+            "driver": normalized_format.upper(),
+            "file_size": file_path.stat().st_size,
+            "width": width,
+            "height": height,
+            "bands": 3,
+            "crs": None,
+            "bounds": None,
+            "preview_image": "source-preview.png",
+        }
+    elif normalized_format == "zip":
+        # Check if project zip or SVF zip
+        metadata = {
+            "file_size": file_path.stat().st_size,
+            "format": "zip",
+            "crs": None,
+            "bounds": None,
+        }
     else:
         raise ApplicationError(
             status_code=400,
             code="UNSUPPORTED_METADATA_FORMAT",
             message="Metadata extraction is not supported for this file format.",
-            details="The detected format has no metadata extractor.",
+            details="Supported formats are PNG, JPG/JPEG, PDF, CAD (.dxf, .dwg), SVF (.svf), and MapStudio packages (.zip).",
             field="file",
         )
 

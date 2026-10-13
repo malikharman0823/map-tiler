@@ -1,14 +1,28 @@
+import asyncio
+from contextlib import asynccontextmanager
+import io
 import logging
-from typing import Annotated
+import zipfile
+from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import Depends, FastAPI, File, Request, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from database import DatabaseError, DatabaseSession, get_db, initialize_database
+from config import settings
+from storage.session import (
+    RepositoryError,
+    SessionRepository,
+    cleanup_expired_sessions,
+    cleanup_orphaned_storage,
+    get_session_repository,
+    initialize_sessions,
+    session_storage,
+    validate_session_id,
+)
 from functions.dataset_delete.function import delete_dataset
 from functions.dataset_delete.request import DatasetDeleteRequest
 from functions.dataset_delete.response import DatasetDeleteResponse
@@ -67,7 +81,8 @@ from functions.tile_read.function import read_tile
 from functions.tile_read.request import TileReadRequest
 from functions.tile_read.response import TILE_READ_RESPONSES
 from functions.upload.function import upload_file
-from functions.upload.response import UploadResponse
+from functions.upload.response import UploadData, UploadResponse
+from functions.raster_zip.function import import_raster_zip
 from functions.icon_points.function import (
     create_icon_point,
     delete_icon_point,
@@ -89,29 +104,88 @@ from functions.map_projects.response import MapProjectResponse
 from functions.map_projects.function import get_project, update_project
 from functions.map_projects.export import export_project
 from functions.map_projects.import_func import import_project
+from functions.map_projects.import_folder import import_project_folder
 from functions.vector_preview.function import get_vector_preview
 from functions.mbtiles.function import get_mbtiles_tile
+from functions.workspace.layers import (
+    WorkspaceTableRecordsResponse,
+    get_workspace_table_records as get_legacy_workspace_table_records,
+)
+from functions.workspace.function import (
+    attach_workspace_member,
+    detach_workspace_member,
+    get_workspace_manifest,
+    get_workspace_records,
+    update_workspace_member,
+    update_workspace_state,
+)
+from functions.workspace.request import (
+    WorkspaceMemberCreateRequest,
+    WorkspaceMemberUpdateRequest,
+    WorkspaceStateUpdateRequest,
+)
+from functions.workspace.response import (
+    WorkspaceManifestResponse,
+    WorkspaceRecordsResponse,
+)
 from models.dataset import Dataset
 from schemas.error import ApplicationError, make_error_response
+from functions.background_removal.request import BackgroundRemovalRequest
+from functions.background_removal.response import BackgroundRemovalResponse
+from functions.background_removal.function import (
+    get_background_removal_status,
+    handle_background_removal,
+)
 
 
 logger = logging.getLogger(__name__)
 
 
-app = FastAPI(title="MapTiler Clone API")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    initialize_sessions()
+    cleanup_orphaned_storage()
+
+    stop_event = asyncio.Event()
+
+    async def _cleanup_loop():
+        while not stop_event.is_set():
+            try:
+                await asyncio.sleep(settings.cleanup_interval_seconds)
+                cleanup_expired_sessions()
+                cleanup_orphaned_storage()
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Error in background session cleanup loop")
+
+    cleanup_task = asyncio.create_task(_cleanup_loop())
+    yield
+    stop_event.set()
+    cleanup_task.cancel()
+    # On server shutdown, purge all active session data and temporary images
+    if not settings.restore_sessions_on_startup:
+        session_storage.purge_all_sessions()
 
 
-@app.on_event("startup")
-def create_missing_database_tables() -> None:
-    initialize_database()
+app = FastAPI(title="MapTiler Clone API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
-    expose_headers=["Content-Disposition", "Content-Length", "ETag"],
+    expose_headers=["Content-Disposition", "Content-Length", "ETag", "X-Session-ID"],
 )
+
+
+@app.middleware("http")
+async def session_header_middleware(request: Request, call_next):
+    response = await call_next(request)
+    session_id = getattr(request.state, "session_id", None)
+    if session_id:
+        response.headers["X-Session-ID"] = session_id
+    return response
 
 
 @app.exception_handler(ApplicationError)
@@ -119,6 +193,7 @@ async def application_error_handler(
     request: Request,
     exc: ApplicationError,
 ) -> JSONResponse:
+    logger.warning("Application error [%s]: %s - %s (field: %s)", exc.code, exc.message, exc.details, exc.field)
     return make_error_response(
         status_code=exc.status_code,
         code=exc.code,
@@ -185,16 +260,16 @@ async def http_error_handler(
     )
 
 
-@app.exception_handler(DatabaseError)
-async def database_error_handler(
+@app.exception_handler(RepositoryError)
+async def repository_error_handler(
     request: Request,
-    exc: DatabaseError,
+    exc: RepositoryError,
 ) -> JSONResponse:
-    logger.exception("A database operation failed.", exc_info=exc)
+    logger.exception("A session repository operation failed.", exc_info=exc)
     return make_error_response(
         status_code=500,
         code="DATABASE_ERROR",
-        message="A database error occurred.",
+        message="A session storage error occurred.",
         details="The operation could not be completed.",
     )
 
@@ -216,6 +291,116 @@ async def unexpected_error_handler(
 @app.get("/health")
 def health() -> dict[str, object]:
     return {"success": True, "data": {"status": "ok"}}
+
+
+from storage.session import session_storage, validate_session_id
+from storage.session import cleanup_expired_sessions
+
+
+@app.post("/sessions", status_code=201)
+def create_session_endpoint() -> dict[str, object]:
+    repo = session_storage.create_session()
+    return {
+        "success": True,
+        "data": {
+            "session_id": repo.session_id,
+            "status": repo.status,
+            "created_at": repo.created_at.isoformat(),
+            "last_accessed_at": repo.last_accessed_at.isoformat(),
+        },
+    }
+
+
+@app.get("/sessions/current")
+def get_current_session_endpoint(db: SessionRepository = Depends(get_session_repository)) -> dict[str, object]:
+    return {
+        "success": True,
+        "data": {
+            "session_id": db.session_id,
+            "status": db.status,
+            "created_at": db.created_at.isoformat(),
+            "last_accessed_at": db.last_accessed_at.isoformat(),
+            "dataset_count": len(db.datasets),
+            "map_configuration": db.get_map_configuration(),
+        },
+    }
+
+
+@app.get("/sessions/{session_id}")
+def get_session_endpoint(session_id: str) -> dict[str, object]:
+    clean_id = validate_session_id(session_id)
+    repo = session_storage.get_session(clean_id)
+    if repo is None:
+        raise StarletteHTTPException(status_code=404, detail="Session not found or expired")
+    return {
+        "success": True,
+        "data": {
+            "session_id": repo.session_id,
+            "status": repo.status,
+            "created_at": repo.created_at.isoformat(),
+            "last_accessed_at": repo.last_accessed_at.isoformat(),
+            "dataset_count": len(repo.datasets),
+            "map_configuration": repo.get_map_configuration(),
+        },
+    }
+
+
+@app.post("/sessions/current/end")
+@app.delete("/sessions/current")
+def end_current_session_endpoint(db: SessionRepository = Depends(get_session_repository)) -> dict[str, object]:
+    sid = db.session_id
+    success = session_storage.end_session(sid, force=True)
+    cleanup_orphaned_storage()
+    return {
+        "success": True,
+        "data": {
+            "session_id": sid,
+            "terminated": success,
+            "message": "Current session ended and all image data deleted.",
+        },
+    }
+
+
+@app.post("/sessions/{session_id}/end")
+@app.delete("/sessions/{session_id}")
+def end_session_endpoint(session_id: str) -> dict[str, object]:
+    clean_id = validate_session_id(session_id)
+    success = session_storage.end_session(clean_id, force=True)
+    cleanup_orphaned_storage()
+    return {
+        "success": True,
+        "data": {
+            "session_id": clean_id,
+            "terminated": success,
+            "message": "Session ended and all temporary image and workspace data removed.",
+        },
+    }
+
+
+@app.get("/sessions/{session_id}/map-config")
+def get_session_map_config_endpoint(session_id: str) -> dict[str, object]:
+    clean_id = validate_session_id(session_id)
+    repo = session_storage.get_session(clean_id)
+    if repo is None:
+        raise StarletteHTTPException(status_code=404, detail="Session not found")
+    return {"success": True, "data": repo.get_map_configuration()}
+
+
+@app.put("/sessions/{session_id}/map-config")
+def save_session_map_config_endpoint(session_id: str, config: dict[str, object]) -> dict[str, object]:
+    clean_id = validate_session_id(session_id)
+    repo = session_storage.get_session(clean_id)
+    if repo is None:
+        raise StarletteHTTPException(status_code=404, detail="Session not found")
+    repo.save_map_configuration(config)
+    return {"success": True, "data": repo.get_map_configuration()}
+
+
+@app.post("/sessions/cleanup")
+def trigger_cleanup_endpoint() -> dict[str, object]:
+    cleaned = cleanup_expired_sessions()
+    return {"success": True, "data": {"cleaned_sessions": cleaned}}
+
 
 import os
 from pydantic import BaseModel
@@ -248,17 +433,83 @@ def get_icon(icon_key: str) -> FileResponse:
     raise StarletteHTTPException(status_code=404, detail="Icon not found")
 
 
+async def _try_import_project_zip(file: UploadFile, db: SessionRepository) -> UploadResponse | None:
+    try:
+        await file.seek(0)
+        content = await file.read()
+        await file.seek(0)
+        bio = io.BytesIO(content)
+        if zipfile.is_zipfile(bio):
+            with zipfile.ZipFile(bio, "r") as z:
+                if "mapstudio.json" in z.namelist():
+                    await file.seek(0)
+                    project_res = await import_project(file, db)
+                    dataset = (
+                        db.get_dataset(project_res.dataset_id)
+                        if project_res.dataset_id is not None
+                        else None
+                    )
+                    if dataset is not None:
+                        return UploadResponse(
+                            data=UploadData(
+                                id=dataset.id,
+                                filename=dataset.filename,
+                                file_size=dataset.file_size,
+                                content_type=dataset.content_type,
+                                file_hash=dataset.file_hash,
+                                storage_path=dataset.storage_path,
+                                metadata=dataset.extracted_metadata or {},
+                                existing=False,
+                                message="Project package imported successfully.",
+                                is_georeferenced=dataset.georeferenced_path is not None,
+                                georeference_status=dataset.georeference_status,
+                            )
+                        )
+    except Exception:
+        await file.seek(0)
+    return None
+
+
 @app.post("/upload", response_model=UploadResponse, status_code=201)
 async def upload(
+    background_tasks: BackgroundTasks,
     file: Annotated[UploadFile | None, File()] = None,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> UploadResponse:
-    return await upload_file(file=file, db=db)
+    if file is not None and (file.filename or "").lower().endswith(".zip"):
+        project_resp = await _try_import_project_zip(file, db)
+        if project_resp is not None:
+            return project_resp
+        return await import_raster_zip(
+            file=file,
+            db=db,
+            background_tasks=background_tasks,
+        )
+    return await upload_file(file=file, db=db, background_tasks=background_tasks)
+
+
+@app.post("/datasets/import-zip", response_model=UploadResponse, status_code=201)
+async def import_dataset_zip(
+    background_tasks: BackgroundTasks,
+    file: Annotated[UploadFile | None, File()] = None,
+    db: SessionRepository = Depends(get_session_repository),
+) -> UploadResponse:
+    if file is not None and not (file.filename or "").lower().endswith(".zip"):
+        return await upload_file(file=file, db=db, background_tasks=background_tasks)
+    if file is not None:
+        project_resp = await _try_import_project_zip(file, db)
+        if project_resp is not None:
+            return project_resp
+    return await import_raster_zip(
+        file=file,
+        db=db,
+        background_tasks=background_tasks,
+    )
 
 
 @app.get("/datasets", response_model=DatasetListResponse)
 def get_datasets(
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> DatasetListResponse:
     return list_datasets(db)
 
@@ -266,7 +517,7 @@ def get_datasets(
 @app.get("/datasets/{dataset_id}", response_model=DatasetDetailResponse)
 def get_dataset(
     dataset_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> DatasetDetailResponse:
     return get_dataset_detail(
         DatasetDetailRequest(dataset_id=dataset_id),
@@ -277,7 +528,7 @@ def get_dataset(
 @app.get("/datasets/{dataset_id}/source-image", response_class=FileResponse)
 def get_dataset_source(
     dataset_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> FileResponse:
     source_image = get_dataset_source_image(dataset_id, db)
     return FileResponse(
@@ -293,7 +544,7 @@ def get_dataset_source(
 )
 async def get_dataset_pbf_preview(
     dataset_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> PbfPreviewResponse:
     return await get_pbf_preview(dataset_id, db)
 
@@ -302,10 +553,15 @@ async def get_dataset_pbf_preview(
 def get_dataset_vector_preview(
     dataset_id: UUID,
     raw: bool = False,
-    db: DatabaseSession = Depends(get_db),
-) -> dict[str, object]:
+    db: SessionRepository = Depends(get_session_repository),
+) -> dict[str, Any]:
     response = get_vector_preview(dataset_id, db)
-    return response["data"]["geojson"] if raw else response
+    data = response.get("data")
+    if raw and isinstance(data, dict):
+        geojson_data = data.get("geojson")
+        if isinstance(geojson_data, dict):
+            return geojson_data
+    return response
 
 
 @app.get("/datasets/{dataset_id}/mbtiles/{z}/{x}/{y}")
@@ -314,7 +570,7 @@ def read_dataset_mbtiles_tile(
     z: int,
     x: int,
     y: int,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ):
     return get_mbtiles_tile(dataset_id, z, x, y, db)
 
@@ -322,12 +578,35 @@ def read_dataset_mbtiles_tile(
 @app.delete("/datasets/{dataset_id}", response_model=DatasetDeleteResponse)
 def remove_dataset(
     dataset_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> DatasetDeleteResponse:
     return delete_dataset(
         DatasetDeleteRequest(dataset_id=dataset_id),
         db,
     )
+
+
+@app.get(
+    "/datasets/{dataset_id}/background-removal",
+    response_model=BackgroundRemovalResponse,
+)
+def get_dataset_background_removal(
+    dataset_id: UUID,
+    db: SessionRepository = Depends(get_session_repository),
+) -> BackgroundRemovalResponse:
+    return get_background_removal_status(dataset_id, db)
+
+
+@app.post(
+    "/datasets/{dataset_id}/background-removal",
+    response_model=BackgroundRemovalResponse,
+)
+def post_dataset_background_removal(
+    dataset_id: UUID,
+    request: BackgroundRemovalRequest,
+    db: SessionRepository = Depends(get_session_repository),
+) -> BackgroundRemovalResponse:
+    return handle_background_removal(dataset_id, request, db)
 
 
 @app.post(
@@ -338,7 +617,7 @@ def remove_dataset(
 def create_dataset_control_point(
     dataset_id: UUID,
     request: CreateControlPointRequest,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> ControlPointResponse:
     return create_control_point(
         DatasetControlPointsRequest(dataset_id=dataset_id),
@@ -353,7 +632,7 @@ def create_dataset_control_point(
 )
 def get_dataset_control_points(
     dataset_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> ControlPointListResponse:
     return list_control_points(
         DatasetControlPointsRequest(dataset_id=dataset_id),
@@ -368,7 +647,7 @@ def get_dataset_control_points(
 def replace_control_point(
     control_point_id: UUID,
     request: UpdateControlPointRequest,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> ControlPointResponse:
     return update_control_point(
         ControlPointRequest(control_point_id=control_point_id),
@@ -383,7 +662,7 @@ def replace_control_point(
 )
 def remove_control_point(
     control_point_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> ControlPointResponse:
     return delete_control_point(
         ControlPointRequest(control_point_id=control_point_id),
@@ -398,7 +677,7 @@ def remove_control_point(
 def georeference_raster_dataset(
     dataset_id: UUID,
     request: GeoreferenceOptionsRequest,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> GeoreferenceResponse:
     response = georeference_dataset(
         GeoreferenceRequest(
@@ -438,7 +717,7 @@ def georeference_raster_dataset(
 )
 def get_saved_georeference(
     dataset_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> GeoreferenceLookupResponse:
     return get_georeference_config(dataset_id, db)
 
@@ -451,7 +730,7 @@ def get_saved_georeference(
 def create_dataset_icon_point(
     dataset_id: UUID,
     request: CreateIconPointRequest,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> IconPointResponse:
     return create_icon_point(
         DatasetIconPointsRequest(dataset_id=dataset_id), request, db
@@ -464,7 +743,7 @@ def create_dataset_icon_point(
 )
 def get_dataset_icon_points(
     dataset_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> IconPointListResponse:
     return list_icon_points(
         DatasetIconPointsRequest(dataset_id=dataset_id), db
@@ -475,7 +754,7 @@ def get_dataset_icon_points(
 def replace_icon_point(
     icon_point_id: UUID,
     request: UpdateIconPointRequest,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> IconPointResponse:
     return update_icon_point(
         IconPointRequest(icon_point_id=icon_point_id), request, db
@@ -485,7 +764,7 @@ def replace_icon_point(
 @app.delete("/icon-points/{icon_point_id}", response_model=IconPointResponse)
 def remove_icon_point(
     icon_point_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> IconPointResponse:
     return delete_icon_point(
         IconPointRequest(icon_point_id=icon_point_id), db
@@ -499,7 +778,7 @@ def remove_icon_point(
 def process_raster_dataset(
     dataset_id: UUID,
     request: RasterProcessOptionsRequest,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> RasterProcessResponse:
     return process_raster(
         RasterProcessRequest(
@@ -517,7 +796,7 @@ def process_raster_dataset(
 def generate_dataset_tiles(
     dataset_id: UUID,
     request: TileGenerationOptionsRequest,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> TileGenerationResponse:
     return generate_tiles(
         TileGenerationRequest(
@@ -538,7 +817,7 @@ def read_dataset_tile(
     z: int,
     x: int,
     y: int,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> FileResponse:
     return read_tile(
         TileReadRequest(dataset_id=dataset_id, z=z, x=x, y=y),
@@ -549,7 +828,7 @@ def read_dataset_tile(
 @app.get("/datasets/{dataset_id}/project", response_model=MapProjectResponse)
 def get_map_project(
     dataset_id: UUID,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> MapProjectResponse:
     return get_project(dataset_id, db)
 
@@ -558,23 +837,165 @@ def get_map_project(
 def put_map_project(
     dataset_id: UUID,
     request: MapProjectUpdateRequest,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> MapProjectResponse:
     return update_project(dataset_id, request, db)
 
 
-@app.get("/datasets/{dataset_id}/export/{format}")
+@app.get("/datasets/{dataset_id}/export")
 def export_map_project(
     dataset_id: UUID,
-    format: str,
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ):
-    return export_project(dataset_id, format, db)
+    with db.protect_operation("export"):
+        return export_project(dataset_id, db)
 
 
 @app.post("/map-projects/import", response_model=MapProjectResponse)
 async def post_import_project(
     file: Annotated[UploadFile, File()],
-    db: DatabaseSession = Depends(get_db),
+    db: SessionRepository = Depends(get_session_repository),
 ) -> MapProjectResponse:
     return await import_project(file, db)
+
+
+@app.post("/map-projects/import-folder", response_model=MapProjectResponse)
+async def post_import_project_folder(
+    files: Annotated[list[UploadFile], File()],
+    paths: Annotated[list[str], Form()],
+    db: SessionRepository = Depends(get_session_repository),
+) -> MapProjectResponse:
+    return await import_project_folder(files, paths, db)
+
+
+@app.get("/workspace/table-records", response_model=WorkspaceTableRecordsResponse)
+def get_legacy_workspace_records(
+    dataset_ids: str | None = None,
+    db: SessionRepository = Depends(get_session_repository),
+) -> WorkspaceTableRecordsResponse:
+    parsed_ids = None
+    if dataset_ids:
+        try:
+            parsed_ids = [UUID(did.strip()) for did in dataset_ids.split(",") if did.strip()]
+        except ValueError:
+            parsed_ids = None
+    return get_legacy_workspace_table_records(db, parsed_ids)
+
+
+@app.get(
+    "/datasets/{dataset_id}/workspace",
+    response_model=WorkspaceManifestResponse,
+)
+def get_dataset_workspace(
+    dataset_id: UUID,
+    db: SessionRepository = Depends(get_session_repository),
+) -> WorkspaceManifestResponse:
+    return get_workspace_manifest(dataset_id, db)
+
+
+@app.post(
+    "/datasets/{dataset_id}/workspace/members",
+    response_model=WorkspaceManifestResponse,
+    status_code=201,
+)
+def post_dataset_workspace_member(
+    dataset_id: UUID,
+    request: WorkspaceMemberCreateRequest,
+    db: SessionRepository = Depends(get_session_repository),
+) -> WorkspaceManifestResponse:
+    return attach_workspace_member(dataset_id, request, db)
+
+
+@app.patch(
+    "/datasets/{dataset_id}/workspace/members/{member_dataset_id}",
+    response_model=WorkspaceManifestResponse,
+)
+def patch_dataset_workspace_member(
+    dataset_id: UUID,
+    member_dataset_id: UUID,
+    request: WorkspaceMemberUpdateRequest,
+    db: SessionRepository = Depends(get_session_repository),
+) -> WorkspaceManifestResponse:
+    return update_workspace_member(
+        dataset_id,
+        member_dataset_id,
+        request,
+        db,
+    )
+
+
+@app.delete(
+    "/datasets/{dataset_id}/workspace/members/{member_dataset_id}",
+    response_model=WorkspaceManifestResponse,
+)
+def delete_dataset_workspace_member(
+    dataset_id: UUID,
+    member_dataset_id: UUID,
+    db: SessionRepository = Depends(get_session_repository),
+) -> WorkspaceManifestResponse:
+    return detach_workspace_member(dataset_id, member_dataset_id, db)
+
+
+@app.patch(
+    "/datasets/{dataset_id}/workspace/state",
+    response_model=WorkspaceManifestResponse,
+)
+def patch_dataset_workspace_state(
+    dataset_id: UUID,
+    request: WorkspaceStateUpdateRequest,
+    db: SessionRepository = Depends(get_session_repository),
+) -> WorkspaceManifestResponse:
+    return update_workspace_state(dataset_id, request, db)
+
+
+@app.get(
+    "/datasets/{dataset_id}/workspace/records",
+    response_model=WorkspaceRecordsResponse,
+)
+def get_dataset_workspace_records(
+    dataset_id: UUID,
+    page: Annotated[int, Query(ge=1)] = 1,
+    page_size: Annotated[int, Query(ge=1, le=100)] = 25,
+    search: str | None = None,
+    member_dataset_id: UUID | None = None,
+    kind: Literal["raster", "control_point", "icon_point"] | None = None,
+    status: str | None = None,
+    sort: Literal["name", "kind", "dataset", "status", "updated_at"] = "name",
+    order: Literal["asc", "desc"] = "asc",
+    db: SessionRepository = Depends(get_session_repository),
+) -> WorkspaceRecordsResponse:
+    return get_workspace_records(
+        dataset_id,
+        db,
+        page=page,
+        page_size=page_size,
+        search=search,
+        dataset_id=member_dataset_id,
+        kind=kind,
+        status=status,
+        sort=sort,
+        order=order,
+    )
+
+
+@app.post(
+    "/datasets/{dataset_id}/background-removal",
+    response_model=BackgroundRemovalResponse,
+)
+def post_background_removal(
+    dataset_id: UUID,
+    request: BackgroundRemovalRequest,
+    db: SessionRepository = Depends(get_session_repository),
+) -> BackgroundRemovalResponse:
+    return handle_background_removal(dataset_id, request, db)
+
+
+@app.get(
+    "/datasets/{dataset_id}/background-removal",
+    response_model=BackgroundRemovalResponse,
+)
+def get_background_removal(
+    dataset_id: UUID,
+    db: SessionRepository = Depends(get_session_repository),
+) -> BackgroundRemovalResponse:
+    return get_background_removal_status(dataset_id, db)

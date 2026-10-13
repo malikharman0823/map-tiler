@@ -1,214 +1,475 @@
-import React, { useEffect, useState, useMemo } from "react"
-import { Link, useNavigate } from "react-router-dom"
-import { listDatasets, readableApiError, importMapProject } from "../api"
+import React, { useEffect, useRef, useState } from "react"
+import { useNavigate } from "react-router-dom"
+import {
+  listDatasets,
+  deleteDataset,
+  readableApiError,
+  importProjectFolder,
+  importMapProject,
+  importDatasetZip,
+  uploadDataset,
+} from "../api"
+import UploadBox, { ACCEPTED_FORMATS } from "../components/UploadBox"
+import UploadStatus from "../components/UploadStatus"
 import DatasetCard from "../components/DatasetCard"
 import TopHeader from "../components/TopHeader"
-
-function formatBytes(bytes) {
-  if (bytes === 0) return '0 Bytes';
-  const k = 1024;
-  const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
-  const i = Math.floor(Math.log(bytes) / Math.log(k));
-  return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-}
+import { Button } from "@/components/ui/button"
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog"
+import {
+  FolderOpen,
+  Archive,
+  Loader2,
+  Sliders,
+  Globe2,
+  FileCheck2,
+  MapPinned,
+  Database,
+  X,
+  AlertCircle,
+  Layers,
+} from "lucide-react"
 
 export default function HomePage() {
+  const navigate = useNavigate()
+  const replacementInputRef = useRef(null)
+
+  // Upload state
+  const [file, setFile] = useState(null)
+  const [state, setState] = useState("idle")
+  const [progress, setProgress] = useState(0)
+  const [result, setResult] = useState(null)
+  const [error, setError] = useState(null)
+
+  // Session dataset catalog state
   const [datasets, setDatasets] = useState([])
   const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
-  const [searchQuery, setSearchQuery] = useState("")
-  const [viewMode, setViewMode] = useState("grid") // 'grid' | 'list'
   const [importing, setImporting] = useState(false)
+  const [datasetToDelete, setDatasetToDelete] = useState(null)
+  const [deleting, setDeleting] = useState(false)
 
-  const navigate = useNavigate()
-
-  const handleImport = async (e) => {
-    const file = e.target.files[0]
-    if (!file) return
-    setImporting(true)
-    setError(null)
-    try {
-      const res = await importMapProject(file)
-      navigate(`/datasets/${res.dataset_id}`)
-    } catch (err) {
-      setError(readableApiError(err, "Failed to import project."))
-    } finally {
-      setImporting(false)
-      e.target.value = ""
-    }
-  }
-
-
-  useEffect(() => {
-    const controller = new AbortController()
-    listDatasets(controller.signal)
+  const loadDatasets = () => {
+    setLoading(true)
+    listDatasets()
       .then(setDatasets)
-      .catch((requestError) => {
-        if (requestError.code !== "ERR_CANCELED") {
-          setError(readableApiError(requestError, "Unable to load datasets."))
+      .catch((err) => {
+        if (err.code !== "ERR_CANCELED") {
+          console.warn("Unable to load workspace datasets:", err)
         }
       })
       .finally(() => setLoading(false))
-    return () => controller.abort()
+  }
+
+  useEffect(() => {
+    loadDatasets()
   }, [])
 
-  const filteredDatasets = useMemo(() => {
-    if (!searchQuery.trim()) return datasets
-    const q = searchQuery.toLowerCase()
-    return datasets.filter(d => 
-      (d.name && d.name.toLowerCase().includes(q)) || 
-      (d.filename && d.filename.toLowerCase().includes(q))
-    )
-  }, [datasets, searchQuery])
+  function selectFile(nextFile) {
+    setFile(nextFile)
+    setState("selected")
+    setProgress(0)
+    setResult(null)
+    setError(null)
+  }
 
-  const totalStorage = useMemo(() => {
-    return datasets.reduce((acc, d) => acc + (d.file_size || 0), 0)
-  }, [datasets])
+  function removeFile() {
+    setFile(null)
+    setState("idle")
+    setProgress(0)
+  }
 
-  const tiledDatasets = useMemo(() => {
-    return datasets.filter(d => d.tiling_status === "completed").length
-  }, [datasets])
+  async function upload() {
+    if (!file) return
+    setState("uploading")
+    setProgress(0)
+    setError(null)
+    try {
+      const isZip = (file.name || "").toLowerCase().endsWith(".zip")
+      const uploadFn = isZip ? importDatasetZip : uploadDataset
+      const uploaded = await uploadFn(file, (event) => {
+        if (event.total) setProgress(Math.round((event.loaded / event.total) * 100))
+      })
+      setResult(uploaded)
+      setFile(null)
+      loadDatasets()
+
+      if (uploaded.is_georeferenced) {
+        navigate(`/datasets/${uploaded.id}/workspace?view=map`)
+        return
+      }
+      setState("success")
+    } catch (requestError) {
+      setError(readableApiError(requestError, "Unable to upload the file."))
+      setState("error")
+    }
+  }
+
+  function continueAfterUpload() {
+    if (!result) return
+    if (result.is_georeferenced) {
+      navigate(`/datasets/${result.id}/workspace?view=map`)
+    } else {
+      navigate(`/datasets/${result.id}/workspace?view=database`)
+    }
+  }
+
+  const handleReopenZip = async (event) => {
+    const selectedFile = event.target.files?.[0]
+    if (!selectedFile) return
+    setImporting(true)
+    setError(null)
+    try {
+      let targetId = null
+      try {
+        const res = await importMapProject(selectedFile)
+        targetId = res.data?.id || res.data?.dataset_id || res.dataset_id
+      } catch {
+        const res = await importDatasetZip(selectedFile)
+        targetId = res.id || res.data?.id
+      }
+      if (targetId) {
+        navigate(`/datasets/${targetId}/workspace?view=map`)
+      } else {
+        loadDatasets()
+      }
+    } catch (err) {
+      setError(readableApiError(err, "Failed to reopen exported project package."))
+    } finally {
+      setImporting(false)
+      event.target.value = ""
+    }
+  }
+
+  const handleImportFolder = async (event) => {
+    const files = Array.from(event.target.files)
+    if (!files.length) return
+    setImporting(true)
+    setError(null)
+    try {
+      const res = await importProjectFolder(files)
+      navigate(`/datasets/${res.dataset_id}`)
+    } catch (err) {
+      setError(readableApiError(err, "Failed to import project folder."))
+    } finally {
+      setImporting(false)
+      event.target.value = ""
+    }
+  }
+
+  const handleDeleteConfirm = async () => {
+    if (!datasetToDelete) return
+    setDeleting(true)
+    try {
+      await deleteDataset(datasetToDelete.id)
+      setDatasets((prev) => prev.filter((d) => d.id !== datasetToDelete.id))
+      setDatasetToDelete(null)
+    } catch (err) {
+      setError(readableApiError(err, "Failed to delete dataset."))
+    } finally {
+      setDeleting(false)
+    }
+  }
 
   return (
-    <div className="flex flex-col min-h-screen">
-      <TopHeader 
-        breadcrumbs={[{ label: "Datasets" }]} 
-        actions={
-          <Link to="/upload" className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md border border-zinc-800 bg-zinc-900 hover:bg-zinc-800 text-zinc-200 text-xs font-medium transition-colors">
-            <span className="material-symbols-outlined text-[15px] text-zinc-400">upload_file</span>
-            <span>Upload</span>
-          </Link>
-        }
-      />
+    <div className="flex flex-col min-h-screen bg-[#f5f5f7] text-[#1d1d1f]">
+      <TopHeader breadcrumbs={[{ label: "Upload Dataset" }]} />
 
-      <main className="flex-1 p-6 md:p-8 max-w-7xl mx-auto w-full space-y-6">
-        {/* Top Title Bar */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-          <div>
-            <div className="flex items-center gap-2 text-xs font-mono text-zinc-500 mb-1">
-              <span>SPATIAL ASSET REGISTRY</span>
-              <span className="text-zinc-700">•</span>
-              <span className="text-zinc-400">MapTiler MVP</span>
+      <main className="flex-1 pb-16">
+        <div className="max-w-6xl mx-auto px-4 sm:px-6 md:px-8 py-8 flex flex-col gap-8">
+          {/* Header Section */}
+          <div className="flex flex-col md:flex-row md:items-end justify-between gap-4 pb-6 border-b border-[#e0e0e0]">
+            <div>
+              <div className="flex items-center gap-2 text-[11px] font-semibold uppercase tracking-wider text-[#7a7a7a] mb-1">
+                <span>Spatial Workspace</span>
+                <span>•</span>
+                <span className="text-[#0066cc]">New Dataset</span>
+              </div>
+              <h1 className="text-3xl font-semibold tracking-tight text-[#1d1d1f]">
+                Upload Dataset
+              </h1>
+              <p className="text-sm text-[#7a7a7a] mt-1.5 max-w-xl">
+                Upload GeoTIFF, PNG, JPG, PDF, CAD (.dxf, .dwg), SVF (.svf), GeoJSON, Shapefile (.zip), or Map Studio project packages.
+              </p>
             </div>
-            <h1 className="text-2xl font-semibold tracking-tight text-zinc-100">Datasets &amp; Custom Tilesets</h1>
-            <p className="text-sm text-zinc-400 mt-1">
-              Manage, style, georeference, and inspect vector and raster spatial datasets.
-            </p>
-          </div>
-          <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
-            <input type="file" accept=".mtmap" onChange={handleImport} className="hidden" id="import-input" disabled={importing} />
-            <label htmlFor="import-input" className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-md bg-zinc-900 border border-zinc-800 hover:bg-zinc-800 text-zinc-300 text-xs font-semibold shadow-sm transition-colors cursor-pointer disabled:opacity-50">
-              <span className="material-symbols-outlined text-[16px]">upload</span>
-              <span>{importing ? "Opening..." : "Open Project (.mtmap)"}</span>
-            </label>
-            <Link to="/upload" className="inline-flex items-center gap-1.5 h-9 px-3.5 rounded-md bg-zinc-100 hover:bg-white text-zinc-900 text-xs font-semibold shadow-sm transition-colors">
-              <span className="material-symbols-outlined text-[16px]">add</span>
-              <span>Upload new dataset</span>
-            </Link>
-          </div>
-        </div>
 
-        {/* Metrics Row */}
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-1">
-            <div className="flex items-center justify-between text-xs text-zinc-400">
-              <span className="font-medium">Active Datasets</span>
-              <span className="material-symbols-outlined text-[16px] text-zinc-500">database</span>
-            </div>
-            <div className="text-2xl font-semibold text-zinc-100 tracking-tight">{loading ? '-' : datasets.length}</div>
-          </div>
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-1">
-            <div className="flex items-center justify-between text-xs text-zinc-400">
-              <span className="font-medium">Storage Consumed</span>
-              <span className="material-symbols-outlined text-[16px] text-zinc-500">cloud_done</span>
-            </div>
-            <div className="text-2xl font-semibold text-zinc-100 font-mono tracking-tight">{loading ? '-' : formatBytes(totalStorage)}</div>
-          </div>
-          <div className="rounded-lg border border-zinc-800 bg-zinc-900/50 p-4 space-y-1">
-            <div className="flex items-center justify-between text-xs text-zinc-400">
-              <span className="font-medium">Tiled Datasets</span>
-              <span className="material-symbols-outlined text-[16px] text-zinc-500">layers</span>
-            </div>
-            <div className="text-2xl font-semibold text-zinc-100 tracking-tight">{loading ? '-' : tiledDatasets}</div>
-          </div>
-        </div>
-
-        {/* Filters & Toolbar */}
-        <div className="flex flex-col md:flex-row items-stretch md:items-center justify-between gap-3">
-          <div className="relative flex-1 max-w-md">
-            <span className="material-symbols-outlined text-zinc-500 absolute left-3 top-2.5 text-[16px] pointer-events-none">search</span>
-            <input 
-              type="text"
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full h-9 bg-zinc-900/60 text-zinc-200 text-xs pl-9 pr-3 rounded-md border border-zinc-800 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-zinc-400 focus:border-zinc-400 transition-colors" 
-              placeholder="Filter by name or filename..." 
-            />
-          </div>
-          <div className="flex items-center gap-2 flex-wrap">
-            <div className="inline-flex h-9 p-0.5 rounded-md border border-zinc-800 bg-zinc-900/80 items-center">
-              <button 
-                type="button" 
-                onClick={() => setViewMode('grid')}
-                className={`h-full px-2 rounded-sm flex items-center justify-center transition-colors ${viewMode === 'grid' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`} 
-                title="Grid View"
+            <div className="flex items-center gap-2.5 shrink-0 flex-wrap sm:flex-nowrap">
+              <input
+                type="file"
+                accept=".zip,application/zip"
+                onChange={handleReopenZip}
+                className="hidden"
+                id="reopen-zip-input"
+                disabled={importing}
+              />
+              <Button
+                asChild
+                variant="outline"
+                size="sm"
+                className="h-9 rounded-full border-[#0066cc]/30 bg-[#f0f7ff] hover:bg-[#e1effe] text-xs text-[#0066cc] cursor-pointer font-medium"
               >
-                <span className="material-symbols-outlined text-[16px]">grid_view</span>
-              </button>
-              <button 
-                type="button" 
-                onClick={() => setViewMode('list')}
-                className={`h-full px-2 rounded-sm flex items-center justify-center transition-colors ${viewMode === 'list' ? 'bg-zinc-800 text-zinc-100' : 'text-zinc-400 hover:text-zinc-200'}`} 
-                title="List View"
+                <label htmlFor="reopen-zip-input">
+                  {importing ? (
+                    <Loader2 className="size-3.5 mr-1.5 animate-spin text-[#0066cc]" />
+                  ) : (
+                    <Archive className="size-3.5 mr-1.5 text-[#0066cc]" />
+                  )}
+                  <span>{importing ? "Opening…" : "Reopen Exported Map (.zip)"}</span>
+                </label>
+              </Button>
+
+              <input
+                type="file"
+                multiple
+                webkitdirectory=""
+                directory=""
+                onChange={handleImportFolder}
+                className="hidden"
+                id="import-folder-input"
+                disabled={importing}
+              />
+              <Button
+                asChild
+                variant="outline"
+                size="sm"
+                className="h-9 rounded-full border-[#e0e0e0] bg-[#ffffff] hover:bg-[#fafafc] text-xs text-[#1d1d1f] cursor-pointer"
               >
-                <span className="material-symbols-outlined text-[16px]">view_list</span>
-              </button>
+                <label htmlFor="import-folder-input">
+                  {importing ? (
+                    <Loader2 className="size-3.5 mr-1.5 animate-spin text-[#0066cc]" />
+                  ) : (
+                    <FolderOpen className="size-3.5 mr-1.5 text-[#7a7a7a]" />
+                  )}
+                  <span>{importing ? "Importing…" : "Open Project Folder"}</span>
+                </label>
+              </Button>
+
+              <div className="flex items-center gap-2 bg-[#ffffff] border border-[#e0e0e0] px-3.5 py-1.5 rounded-full shadow-xs">
+                <span className="size-2 rounded-full bg-[#34c759] animate-pulse"></span>
+                <span className="text-xs font-medium text-[#1d1d1f]">Ready</span>
+              </div>
             </div>
           </div>
+
+          {/* Global Error Alert */}
+          {error && (
+            <div className="rounded-[18px] border border-[#ff3b30]/30 bg-[#ff3b30]/5 p-4 flex items-center gap-3">
+              <AlertCircle className="size-5 text-[#ff3b30] shrink-0" />
+              <div className="text-xs">
+                <p className="font-semibold text-[#ff3b30]">{error.message || "An error occurred"}</p>
+                {error.details && <p className="text-[#ff3b30]/80 mt-0.5">{error.details}</p>}
+              </div>
+            </div>
+          )}
+
+          {/* Main Upload Area */}
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+            {/* Left Column: Dropzone & Upload Box (7 Cols) */}
+            <div className="lg:col-span-7 flex flex-col gap-6">
+              {state === "idle" ? (
+                <UploadBox disabled={false} onSelect={selectFile} />
+              ) : (
+                <UploadStatus
+                  state={state}
+                  file={file}
+                  progress={progress}
+                  result={result}
+                  error={error}
+                  onRemove={removeFile}
+                  onReplace={() => replacementInputRef.current?.click()}
+                  onUpload={upload}
+                  onRetry={() => setState(file ? "selected" : "idle")}
+                  onOpen={continueAfterUpload}
+                />
+              )}
+            </div>
+
+            {/* Right Column: Ingestion Parameters (5 Cols) */}
+            <div className="lg:col-span-5 flex flex-col gap-4">
+              <div className="border border-[#e0e0e0] rounded-[18px] bg-[#ffffff] p-6 space-y-5 shadow-xs">
+                <div className="flex items-center justify-between pb-3 border-b border-[#f0f0f0]">
+                  <div className="flex items-center gap-2">
+                    <Sliders className="size-4 text-[#0066cc]" />
+                    <h3 className="text-sm font-semibold text-[#1d1d1f]">
+                      Ingestion Parameters
+                    </h3>
+                  </div>
+                  <span className="text-[10px] font-mono text-[#7a7a7a] px-2 py-0.5 rounded-full bg-[#f5f5f7] border border-[#e0e0e0]">
+                    Auto
+                  </span>
+                </div>
+
+                <div className="space-y-2">
+                  <label className="text-xs font-medium text-[#1d1d1f] flex items-center justify-between">
+                    <span className="flex items-center gap-1.5">
+                      <Globe2 className="size-3.5 text-[#7a7a7a]" />
+                      Georeference detection
+                    </span>
+                    <span className="text-[10px] text-[#0066cc] font-mono font-semibold">
+                      AUTOMATIC
+                    </span>
+                  </label>
+                  <div className="w-full bg-[#f5f5f7] border border-[#e0e0e0] rounded-xl py-2 px-3 text-xs text-[#1d1d1f] font-mono flex items-center justify-between">
+                    <span>Raster metadata + sidecars</span>
+                    <FileCheck2 className="size-3.5 text-[#34c759]" />
+                  </div>
+                  <p className="text-[11px] text-[#7a7a7a]">
+                    Georeferenced rasters open directly on the map. Raw rasters allow point-based georeferencing.
+                  </p>
+                </div>
+
+                <div className="pt-2 border-t border-[#f0f0f0] space-y-3">
+                  <div className="flex items-start justify-between gap-3 p-3 rounded-xl bg-[#fafafc] border border-[#e0e0e0]">
+                    <div className="space-y-0.5">
+                      <div className="text-xs font-semibold text-[#1d1d1f]">
+                        Auto-Tiling Pipeline
+                      </div>
+                      <p className="text-[11px] text-[#7a7a7a]">
+                        Rasters are automatically processed and converted into Slippy tiles.
+                      </p>
+                    </div>
+                    <span className="size-2 rounded-full bg-[#34c759] mt-1 shrink-0"></span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Active Datasets in this Session (if any exist) */}
+          {datasets.length > 0 && (
+            <div className="pt-8 border-t border-[#e0e0e0] space-y-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-2">
+                  <Layers className="size-4 text-[#0066cc]" />
+                  <h2 className="text-sm font-semibold tracking-tight text-[#1d1d1f]">
+                    Active Workspace Datasets ({datasets.length})
+                  </h2>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4">
+                {datasets.map((dataset) => (
+                  <DatasetCard
+                    key={dataset.id}
+                    dataset={dataset}
+                    viewMode="grid"
+                    onDeleteClick={setDatasetToDelete}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
         </div>
 
-        {/* Content */}
-        {loading && <p className="text-sm text-zinc-400 text-center py-12">Loading datasets…</p>}
-        {error && (
-          <div className="rounded-lg border border-red-900/40 bg-red-950/20 p-4 text-center">
-            <p className="text-red-400 text-sm font-semibold">{error.message}</p>
-            <p className="mt-1 text-xs text-red-400/80">{error.details}</p>
-          </div>
-        )}
-
-        {!loading && !error && datasets.length === 0 && (
-          <div className="rounded-lg border border-zinc-800 border-dashed py-16 text-center bg-zinc-900/20">
-            <span className="material-symbols-outlined text-4xl text-zinc-600 mb-3">dataset</span>
-            <p className="text-sm font-semibold text-zinc-200">No datasets yet</p>
-            <p className="mt-1 text-xs text-zinc-500 mb-4">Upload your first dataset to begin mapping.</p>
-            <Link to="/upload" className="inline-flex items-center gap-1.5 h-8 px-3 rounded-md bg-zinc-100 hover:bg-white text-zinc-900 text-xs font-semibold shadow-sm transition-colors">
-              Upload Dataset
-            </Link>
-          </div>
-        )}
-
-        {!loading && !error && datasets.length > 0 && filteredDatasets.length === 0 && (
-          <div className="py-12 text-center">
-            <p className="text-sm text-zinc-400">No datasets match your search.</p>
-          </div>
-        )}
-
-        {!loading && !error && filteredDatasets.length > 0 && viewMode === 'grid' && (
-          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-4">
-            {filteredDatasets.map((dataset) => (
-              <DatasetCard key={dataset.id} dataset={dataset} viewMode="grid" />
-            ))}
-          </div>
-        )}
-
-        {!loading && !error && filteredDatasets.length > 0 && viewMode === 'list' && (
-          <div className="flex flex-col gap-2">
-             {filteredDatasets.map((dataset) => (
-              <DatasetCard key={dataset.id} dataset={dataset} viewMode="list" />
-            ))}
-          </div>
-        )}
+        <input
+          ref={replacementInputRef}
+          type="file"
+          accept={ACCEPTED_FORMATS}
+          className="sr-only"
+          onChange={(event) => {
+            const [nextFile] = event.target.files
+            if (nextFile) selectFile(nextFile)
+          }}
+        />
       </main>
+
+      {/* Un-georeferenced Dialog */}
+      {state === "success" && result && !result.is_georeferenced && (
+        <div className="workspace-dialog-backdrop" role="presentation">
+          <section
+            className="workspace-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="upload-route-title"
+          >
+            <button
+              type="button"
+              className="workspace-dialog-close"
+              onClick={() => setState("idle")}
+              aria-label="Close"
+            >
+              <X />
+            </button>
+            <div className="workspace-dialog-icon">
+              <MapPinned />
+            </div>
+            <h2 id="upload-route-title">This raster is not georeferenced</h2>
+            <p>The dataset is safely stored. Choose where you want to continue.</p>
+            <div className="workspace-dialog-actions workspace-dialog-actions-stacked">
+              <button
+                type="button"
+                className="workspace-primary-button"
+                onClick={() =>
+                  navigate(
+                    `/datasets/${result.id}/georeference?returnTo=${encodeURIComponent(
+                      `/datasets/${result.id}/workspace?view=database`
+                    )}`
+                  )
+                }
+              >
+                <MapPinned /> Open georeferencer
+              </button>
+              <button
+                type="button"
+                className="workspace-secondary-button"
+                onClick={() => navigate(`/datasets/${result.id}/workspace?view=database`)}
+              >
+                <Database /> Inspect database first
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* Delete Dataset Confirmation Dialog */}
+      <AlertDialog
+        open={Boolean(datasetToDelete)}
+        onOpenChange={(open) => !open && setDatasetToDelete(null)}
+      >
+        <AlertDialogContent className="rounded-[20px] bg-[#ffffff] border border-[#e0e0e0] text-[#1d1d1f] shadow-lg max-w-md">
+          <AlertDialogHeader>
+            <AlertDialogTitle className="text-base font-semibold text-[#1d1d1f]">
+              Delete Dataset?
+            </AlertDialogTitle>
+            <AlertDialogDescription className="text-xs text-[#7a7a7a] mt-1.5">
+              Are you sure you want to delete{" "}
+              <strong className="text-[#1d1d1f]">
+                {datasetToDelete?.name || datasetToDelete?.filename}
+              </strong>
+              ? This action will permanently remove all associated rasters, vector caches, and tilesets.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter className="mt-4 gap-2">
+            <AlertDialogCancel
+              disabled={deleting}
+              className="rounded-full border-[#e0e0e0] bg-[#ffffff] hover:bg-[#f5f5f7] text-xs text-[#1d1d1f]"
+            >
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleDeleteConfirm}
+              disabled={deleting}
+              className="rounded-full bg-[#ff3b30] hover:bg-[#e03126] text-white text-xs font-normal"
+            >
+              {deleting ? (
+                <>
+                  <Loader2 className="size-3.5 mr-1.5 animate-spin" />
+                  <span>Deleting…</span>
+                </>
+              ) : (
+                <span>Delete Permanently</span>
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

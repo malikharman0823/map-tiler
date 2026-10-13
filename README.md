@@ -2,6 +2,10 @@
 
 FastAPI and React/Vite map tiling workspace.
 
+The backend uses temporary session repositories rather than a persistent
+database. Session manifests and generated files live under
+`backend/temp/sessions/` and are removed when a session ends or expires.
+
 ## How to Run
 
 ### Backend
@@ -22,6 +26,9 @@ FastAPI and React/Vite map tiling workspace.
    ```powershell
    .\.venv\Scripts\python.exe -m uvicorn main:app --host 127.0.0.1 --port 8000
    ```
+
+Runtime limits and cleanup intervals can be configured through `.env.local`;
+see `.env.example` for the supported settings.
 
 ### Frontend
 

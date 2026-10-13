@@ -1,6 +1,7 @@
 # Dependencies
 node_modules/
 backend/.venv/
+.venv/
 
 # Environment variables
 .env
@@ -16,9 +17,28 @@ frontend/.playwright-cli/
 generated/
 !generated/.gitkeep
 
+# Tool caches and local reports
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage/
+*.log
+
+# Temporary session repository storage
+temp/
+backend/temp/
+*.sqlite
+*.sqlite3
+
 # Runtime uploads and caches
 backend/storage/uploads/
 backend/storage/processed/
+backend/storage/tiles/
 .npm-cache/
 __pycache__/
 *.py[cod]
+
+# Local experiments and editor state
+scratch/
+.vscode/

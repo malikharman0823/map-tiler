@@ -14,6 +14,8 @@ class UploadData(BaseModel):
     metadata: dict[str, Any]
     existing: bool
     message: str
+    is_georeferenced: bool = False
+    georeference_status: str = "not_started"
 
 
 class UploadResponse(BaseModel):

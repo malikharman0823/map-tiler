@@ -5,31 +5,20 @@ from typing import BinaryIO
 from fastapi import UploadFile
 from starlette.concurrency import run_in_threadpool
 
-from database import settings
+from storage.session import settings
 from functions.validate_file.response import ValidateFileData, ValidateFileResponse
 from schemas.error import ApplicationError
 
 
 SUPPORTED_FORMATS = {
+    ".png": {"format": "png", "category": "raster"},
     ".jpg": {"format": "jpg", "category": "raster"},
     ".jpeg": {"format": "jpeg", "category": "raster"},
-    ".png": {"format": "png", "category": "raster"},
-    ".tif": {"format": "tiff", "category": "raster"},
-    ".tiff": {"format": "tiff", "category": "raster"},
-    ".gpkg": {"format": "geopackage", "category": "vector"},
-    ".geojson": {"format": "geojson", "category": "vector"},
-    ".json": {"format": "json", "category": "document"},
-    ".mbtiles": {"format": "mbtiles", "category": "tiles"},
-    ".kml": {"format": "kml", "category": "vector"},
-    ".kmz": {"format": "kmz", "category": "vector"},
-    ".shp": {"format": "shapefile", "category": "vector"},
-    ".shx": {"format": "shapefile", "category": "vector"},
-    ".dbf": {"format": "shapefile", "category": "vector"},
-    ".prj": {"format": "shapefile", "category": "vector"},
-    ".cpg": {"format": "shapefile", "category": "vector"},
-    ".osm": {"format": "osm", "category": "osm"},
-    ".pbf": {"format": "osm_pbf", "category": "osm"},
-    ".osm.pbf": {"format": "osm_pbf", "category": "osm"},
+    ".pdf": {"format": "pdf", "category": "document"},
+    ".dxf": {"format": "cad", "category": "cad"},
+    ".dwg": {"format": "cad", "category": "cad"},
+    ".svf": {"format": "svf", "category": "cad"},
+    ".zip": {"format": "zip", "category": "archive"},
 }
 
 
@@ -91,9 +80,8 @@ async def validate_file(file: UploadFile | None) -> ValidateFileResponse:
             code="UNSUPPORTED_FILE_TYPE",
             message="The uploaded file type is not supported.",
             details=(
-                "Supported formats are GeoPackage, GeoJSON, GeoTIFF, "
-                "MapLibre style JSON, MBTiles, JPG, PNG, KML, KMZ, "
-                "Shapefile components, OSM, and OSM PBF."
+                "Supported formats are PNG, JPG/JPEG, PDF, CAD (.dxf, .dwg), "
+                "SVF (.svf), and exported MapStudio project packages (.zip)."
             ),
             field="filename",
         )

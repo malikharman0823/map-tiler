@@ -47,21 +47,47 @@ function mercatorToLngLat(x, y) {
 
 function usableBounds(bounds, crs) {
   if (!bounds) return null
-  const values = [
-    bounds.min_longitude ?? bounds.min_x,
-    bounds.min_latitude ?? bounds.min_y,
-    bounds.max_longitude ?? bounds.max_x,
-    bounds.max_latitude ?? bounds.max_y,
-  ].map(Number)
-  if (!values.every(Number.isFinite)) return null
-  const [minX, minY, maxX, maxY] = values
+
+  let rawValues = null
+
+  if (Array.isArray(bounds)) {
+    if (bounds.length === 4) {
+      rawValues = bounds.map(Number)
+    } else if (bounds.length === 2 && Array.isArray(bounds[0]) && Array.isArray(bounds[1])) {
+      rawValues = [bounds[0][0], bounds[0][1], bounds[1][0], bounds[1][1]].map(Number)
+    }
+  } else if (typeof bounds === "object") {
+    rawValues = [
+      bounds.min_longitude ?? bounds.min_x ?? bounds.west,
+      bounds.min_latitude ?? bounds.min_y ?? bounds.south,
+      bounds.max_longitude ?? bounds.max_x ?? bounds.east,
+      bounds.max_latitude ?? bounds.max_y ?? bounds.north,
+    ].map(Number)
+  }
+
+  if (!rawValues || !rawValues.every(Number.isFinite)) return null
+
+  const [minX, minY, maxX, maxY] = rawValues
   if (minX >= maxX || minY >= maxY) return null
 
   const normalizedCrs = String(crs || "").toUpperCase()
-  if (normalizedCrs.includes("4326")) return [[minX, minY], [maxX, maxY]]
   if (normalizedCrs.includes("3857")) {
-    return [mercatorToLngLat(minX, minY), mercatorToLngLat(maxX, maxY)]
+    const [swLng, swLat] = mercatorToLngLat(minX, minY)
+    const [neLng, neLat] = mercatorToLngLat(maxX, maxY)
+    if (Number.isFinite(swLng) && Number.isFinite(swLat) && Number.isFinite(neLng) && Number.isFinite(neLat)) {
+      return [swLng, swLat, neLng, neLat]
+    }
+    return null
   }
+
+  if (
+    normalizedCrs.includes("4326") ||
+    normalizedCrs.includes("WGS") ||
+    (minX >= -180 && maxX <= 180 && minY >= -90 && maxY <= 90)
+  ) {
+    return [minX, minY, maxX, maxY]
+  }
+
   return null
 }
 
@@ -370,11 +396,11 @@ export default function Map({
       }
       const targetBounds = usableBounds(bounds, crs)
       if (targetBounds) {
-        sourceOptions.bounds = [targetBounds[0][0], targetBounds[0][1], targetBounds[1][0], targetBounds[1][1]]
+        sourceOptions.bounds = targetBounds
       }
       map.addSource(DATASET_SOURCE_ID, sourceOptions)
     }
-    if (!map.getLayer(DATASET_LAYER_ID)) {
+    if (map.getSource(DATASET_SOURCE_ID) && !map.getLayer(DATASET_LAYER_ID)) {
       const firstPointLayer = [CONTROL_POINTS_LAYER_ID, ICON_POINTS_LAYER_ID]
         .find((layerId) => map.getLayer(layerId))
       map.addLayer({
@@ -385,7 +411,7 @@ export default function Map({
         layout: { visibility: showDatasetRef.current ? "visible" : "none" },
       }, firstPointLayer)
     }
-  }, [mapReady, maxZoom, minZoom, tileUrl, tilesReady])
+  }, [bounds, crs, mapReady, maxZoom, minZoom, tileUrl, tilesReady])
 
   useEffect(() => {
     const map = mapRef.current
@@ -711,7 +737,12 @@ export default function Map({
 
     function fitToDataset() {
       const targetBounds = usableBounds(bounds, crs)
-      if (targetBounds) map.fitBounds(targetBounds, { padding: 72, duration: 800 })
+      if (targetBounds) {
+        map.fitBounds(
+          [[targetBounds[0], targetBounds[1]], [targetBounds[2], targetBounds[3]]],
+          { padding: 72, duration: 800 }
+        )
+      }
     }
 
     if (fitKey && fittedDatasetRef.current !== fitKey && usableBounds(bounds, crs)) {

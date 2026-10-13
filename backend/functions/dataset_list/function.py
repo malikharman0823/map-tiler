@@ -1,6 +1,6 @@
 import logging
 
-from database import DatabaseError, DatabaseSession
+from storage.session import RepositoryError, SessionRepository
 
 from functions.dataset_list.response import (
     DatasetListData,
@@ -39,10 +39,10 @@ def _list_item(dataset: Dataset) -> DatasetListItem:
     )
 
 
-def list_datasets(db: DatabaseSession) -> DatasetListResponse:
+def list_datasets(db: SessionRepository) -> DatasetListResponse:
     try:
         datasets = db.list_datasets()
-    except DatabaseError as exc:
+    except RepositoryError as exc:
         db.rollback()
         logger.exception("Failed to list datasets.", exc_info=exc)
         raise _database_error() from exc
