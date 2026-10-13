@@ -14,6 +14,7 @@ dist/
 frontend/dist/
 frontend/.vite-build-check/
 frontend/.playwright-cli/
+.vercel/
 generated/
 !generated/.gitkeep
 
