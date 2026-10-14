@@ -19,21 +19,14 @@ import {
   resetBackgroundRemoval,
 } from "../api"
 
-const COLOR_PRESETS = [
-  { label: "White", value: "#ffffff" },
-  { label: "Off-White", value: "#f8f9fa" },
-  { label: "Parchment", value: "#faf7ee" },
-  { label: "Blueprint", value: "#1e3a8a" },
-]
-
 export default function BackgroundRemovalDialog({
   open,
   datasetId,
   datasetName = "Raster Layer",
+  isGeoreferenced = true,
   onClose,
   onApplied,
 }) {
-  const [enabled, setEnabled] = useState(false)
   const [color, setColor] = useState("#ffffff")
   const [threshold, setThreshold] = useState(30)
   const [edgeSoftness, setEdgeSoftness] = useState(10)
@@ -42,13 +35,11 @@ export default function BackgroundRemovalDialog({
   const [processing, setProcessing] = useState(false)
   const [previewing, setPreviewing] = useState(false)
   const [previewData, setPreviewData] = useState(null)
-  const [activeTab, setActiveTab] = useState("processed") // 'processed' | 'original'
   const [error, setError] = useState(null)
   const [successMessage, setSuccessMessage] = useState(null)
 
   const previewDebounceRef = useRef(null)
 
-  // Load initial status when opened
   useEffect(() => {
     if (!open || !datasetId) return
     let active = true
@@ -59,19 +50,16 @@ export default function BackgroundRemovalDialog({
     getBackgroundRemoval(datasetId)
       .then((data) => {
         if (!active) return
-        setEnabled(Boolean(data.enabled))
         if (data.color) setColor(data.color)
         if (typeof data.threshold === "number") setThreshold(data.threshold)
         if (typeof data.edge_softness === "number") setEdgeSoftness(data.edge_softness)
         setLoading(false)
-        // Auto-fetch preview
         loadPreview(data.color || "#ffffff", data.threshold ?? 30, data.edge_softness ?? 10)
       })
       .catch((err) => {
         if (!active) return
         setLoading(false)
-        // Fallback default
-        loadPreview("#ffffff", 30, 10)
+        setError(readableApiError(err, "Failed to load background removal settings."))
       })
 
     return () => {
@@ -139,7 +127,6 @@ export default function BackgroundRemovalDialog({
         threshold,
         edgeSoftness,
       })
-      setEnabled(true)
       setProcessing(false)
       setSuccessMessage("Background removal applied to map layer.")
       if (onApplied) onApplied(res)
@@ -157,7 +144,6 @@ export default function BackgroundRemovalDialog({
 
     try {
       const res = await resetBackgroundRemoval(datasetId)
-      setEnabled(false)
       setProcessing(false)
       setSuccessMessage("Original raster restored.")
       if (onApplied) onApplied(res)
@@ -226,32 +212,15 @@ export default function BackgroundRemovalDialog({
           <div className="bg-removal-grid">
             {/* Left Column: Controls */}
             <div className="bg-removal-controls">
-              {/* Enable / Status Toggle */}
-              <div className="bg-removal-section bg-gray-50/80 p-3 rounded-lg border border-gray-200">
-                <div className="flex items-center justify-between">
+              {!isGeoreferenced && (
+                <div className="bg-removal-alert is-error" style={{ marginBottom: "12px" }}>
+                  <AlertCircle />
                   <div>
-                    <span className="text-xs font-semibold text-gray-900">Background Transparency</span>
-                    <p className="text-[11px] text-gray-500">
-                      {enabled ? "Active on map layer" : "Disabled (showing original raster)"}
-                    </p>
+                    <strong>Layer needs georeferencing</strong>
+                    <span>To display transparency on the map tiles, georeference this raster layer first.</span>
                   </div>
-                  <label className="bg-removal-switch" title="Toggle background removal">
-                    <input
-                      type="checkbox"
-                      checked={enabled}
-                      onChange={(e) => {
-                        if (e.target.checked) {
-                          handleApply()
-                        } else {
-                          handleReset()
-                        }
-                      }}
-                      disabled={processing}
-                    />
-                    <span className="slider round" />
-                  </label>
                 </div>
-              </div>
+              )}
 
               {/* Background Color Picker */}
               <div className="bg-removal-section">
@@ -259,7 +228,7 @@ export default function BackgroundRemovalDialog({
                   <span>Background Color to Remove</span>
                   <span className="text-xs font-mono text-gray-500 uppercase">{color}</span>
                 </label>
-                <div className="flex items-center gap-2 mb-2">
+                <div className="flex items-center gap-2">
                   <input
                     type="color"
                     value={color}
@@ -275,19 +244,6 @@ export default function BackgroundRemovalDialog({
                     placeholder="#ffffff"
                     maxLength={7}
                   />
-                </div>
-                <div className="flex flex-wrap gap-1.5">
-                  {COLOR_PRESETS.map((preset) => (
-                    <button
-                      key={preset.value}
-                      type="button"
-                      className={`bg-removal-swatch-btn ${color.toLowerCase() === preset.value.toLowerCase() ? "is-active" : ""}`}
-                      onClick={() => handleColorChange(preset.value)}
-                    >
-                      <span className="swatch-circle" style={{ backgroundColor: preset.value }} />
-                      <span>{preset.label}</span>
-                    </button>
-                  ))}
                 </div>
               </div>
 
@@ -308,17 +264,13 @@ export default function BackgroundRemovalDialog({
                   onChange={(e) => handleThresholdChange(Number(e.target.value))}
                   className="bg-removal-slider"
                 />
-                <div className="flex justify-between text-[10px] text-gray-400 mt-0.5">
-                  <span>Strict (Exact color)</span>
-                  <span>Lenient (Off-white / scans)</span>
-                </div>
               </div>
 
-              {/* Edge Softness Slider (Antialiasing) */}
+              {/* Edge Softness Slider */}
               <div className="bg-removal-section">
                 <div className="flex items-center justify-between mb-1.5">
                   <label className="bg-removal-label mb-0">
-                    <span>Edge Softness (Antialiasing)</span>
+                    <span>Edge Softness</span>
                   </label>
                   <span className="text-xs font-semibold text-blue-600">{edgeSoftness}px</span>
                 </div>
@@ -331,9 +283,6 @@ export default function BackgroundRemovalDialog({
                   onChange={(e) => handleSoftnessChange(Number(e.target.value))}
                   className="bg-removal-slider"
                 />
-                <p className="text-[10px] text-gray-400 mt-0.5">
-                  Preserves fine architectural lines and antialiased drawings without harsh pixelation.
-                </p>
               </div>
             </div>
 
@@ -342,57 +291,24 @@ export default function BackgroundRemovalDialog({
               <div className="flex items-center justify-between mb-2">
                 <span className="text-xs font-semibold text-gray-700 flex items-center gap-1.5">
                   <Eye className="w-3.5 h-3.5 text-gray-500" />
-                  <span>Preview</span>
+                  <span>Transparency Preview</span>
                   {previewing && <Loader2 className="w-3 h-3 animate-spin text-blue-600" />}
                 </span>
-                <div className="bg-removal-tab-group">
-                  <button
-                    type="button"
-                    className={`bg-removal-tab ${activeTab === "processed" ? "is-active" : ""}`}
-                    onClick={() => setActiveTab("processed")}
-                  >
-                    Transparent
-                  </button>
-                  <button
-                    type="button"
-                    className={`bg-removal-tab ${activeTab === "original" ? "is-active" : ""}`}
-                    onClick={() => setActiveTab("original")}
-                  >
-                    Original
-                  </button>
-                </div>
               </div>
 
               {/* Preview Stage with Checkerboard background */}
               <div className="bg-removal-stage">
-                {activeTab === "processed" ? (
-                  previewData?.preview_data_url ? (
-                    <img
-                      src={previewData.preview_data_url}
-                      alt="Transparent preview"
-                      className="bg-removal-stage-img"
-                    />
-                  ) : (
-                    <div className="bg-removal-stage-placeholder">
-                      {previewing ? <Loader2 className="animate-spin" /> : <span>No preview available</span>}
-                    </div>
-                  )
+                {previewData?.preview_data_url ? (
+                  <img
+                    src={previewData.preview_data_url}
+                    alt="Transparent preview"
+                    className="bg-removal-stage-img"
+                  />
                 ) : (
-                  previewData?.original_data_url ? (
-                    <img
-                      src={previewData.original_data_url}
-                      alt="Original preview"
-                      className="bg-removal-stage-img"
-                    />
-                  ) : (
-                    <div className="bg-removal-stage-placeholder">
-                      {previewing ? <Loader2 className="animate-spin" /> : <span>No preview available</span>}
-                    </div>
-                  )
+                  <div className="bg-removal-stage-placeholder">
+                    {previewing ? <Loader2 className="animate-spin" /> : <span>No preview available</span>}
+                  </div>
                 )}
-                <div className="bg-removal-stage-badge">
-                  {activeTab === "processed" ? "Checkerboard = Transparent" : "Original Raster"}
-                </div>
               </div>
             </div>
           </div>

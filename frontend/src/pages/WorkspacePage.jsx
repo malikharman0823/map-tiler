@@ -32,7 +32,7 @@ import useWorkspace from "../hooks/useWorkspace"
 import EndSessionDialog from "../components/EndSessionDialog"
 
 
-function AddDatasetDialog({ open, onClose, onUploaded }) {
+function AddDatasetDialog({ open, onClose, onUploaded, existingMembers = [] }) {
   const inputRef = useRef(null)
   const [state, setState] = useState("confirm")
   const [progress, setProgress] = useState(0)
@@ -49,26 +49,45 @@ function AddDatasetDialog({ open, onClose, onUploaded }) {
   if (!open) return null
 
   async function selectFile(event) {
-    const [file] = event.target.files
+    const files = Array.from(event.target.files || [])
     event.target.value = ""
-    if (!file) return
-    const isZip = (file.name || "").toLowerCase().endsWith(".zip")
-    const isSupported = /\.(png|jpe?g|pdf|dxf|dwg|svf|zip)$/i.test(file.name || "")
-    if (!isSupported) {
+    if (!files.length) return
+    const isSupported = (name) => /\.(png|jpe?g|tif|tiff|webp|bmp|pdf|dxf|dwg|svf|zip)$/i.test(name || "")
+    const invalid = files.find((f) => !isSupported(f.name))
+    if (invalid) {
       setError({
         message: "Unsupported file format.",
-        details: "Supported formats are PNG, JPG, PDF, CAD (.dxf, .dwg), SVF (.svf), and Map Studio project archives (.zip).",
+        details: `File "${invalid.name}" is not supported. Supported formats are PNG, JPG, TIFF, WebP, PDF, CAD, SVF, and ZIP.`,
       })
       return
     }
     setState("uploading")
     setError(null)
     try {
-      const uploadFn = isZip ? importDatasetZip : uploadDataset
-      const dataset = await uploadFn(file, (uploadEvent) => {
-        if (uploadEvent.total) setProgress(Math.round((uploadEvent.loaded / uploadEvent.total) * 100))
-      })
-      await onUploaded(dataset)
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i]
+        const isZip = (file.name || "").toLowerCase().endsWith(".zip")
+        const uploadFn = isZip ? importDatasetZip : uploadDataset
+        const dataset = await uploadFn(file, (uploadEvent) => {
+          if (uploadEvent.total) {
+            const currentPct = (uploadEvent.loaded / uploadEvent.total) * 100
+            const totalPct = Math.round((i * 100 + currentPct) / files.length)
+            setProgress(totalPct)
+          }
+        })
+        const isAlreadyMember = existingMembers.some(
+          (m) => m.dataset_id === dataset.id
+        )
+        if (isAlreadyMember) {
+          setError({
+            message: "Dataset is already attached.",
+            details: `"${file.name}" is already a layer in this workspace. To add a 2nd raster layer, please select a different image file.`,
+          })
+          setState("confirm")
+          return
+        }
+        await onUploaded(dataset)
+      }
     } catch (requestError) {
       setError(readableApiError(requestError, "Unable to add the dataset."))
       setState("confirm")
@@ -96,14 +115,15 @@ function AddDatasetDialog({ open, onClose, onUploaded }) {
           <div className="workspace-dialog-actions">
             <button type="button" className="workspace-secondary-button" onClick={onClose}>Cancel</button>
             <button type="button" className="workspace-primary-button" onClick={() => inputRef.current?.click()}>
-              <Upload /> Select File
+              <Upload /> Select File(s)
             </button>
           </div>
         )}
         <input
           ref={inputRef}
           type="file"
-          accept=".png,.jpg,.jpeg,.pdf,.dxf,.dwg,.svf,.zip,image/png,image/jpeg,application/pdf,application/zip"
+          multiple
+          accept=".png,.jpg,.jpeg,.tif,.tiff,.webp,.bmp,.pdf,.dxf,.dwg,.svf,.zip,image/png,image/jpeg,image/tiff,application/pdf,application/zip"
           className="sr-only"
           onChange={selectFile}
         />
@@ -124,8 +144,17 @@ export default function WorkspacePage() {
   const [exporting, setExporting] = useState(false)
   const [reopening, setReopening] = useState(false)
   const reopenInputRef = useRef(null)
+  const [transformingMember, setTransformingMember] = useState(null)
+  const [activeFloorLevel, setActiveFloorLevel] = useState(0)
   const workspace = useWorkspace(id)
   const view = requestedView === "database" ? "database" : "map"
+
+  function handleSelectFloor(level) {
+    setActiveFloorLevel(level)
+    if (typeof window !== "undefined" && window.__maptiler_setFloor) {
+      window.__maptiler_setFloor(level)
+    }
+  }
 
   async function handleReopenExportedZip(event) {
     const file = event.target.files?.[0]
@@ -207,14 +236,24 @@ export default function WorkspacePage() {
   function selectLayer(datasetId, kind) {
     workspace.setFilters({ datasetId, kind })
     setLayersOpen(false)
-    if (view !== "database") setView("database")
+    if (kind && kind !== "raster" && view !== "database") {
+      setView("database")
+    }
   }
 
   async function handleAddedDataset(dataset) {
-    await workspace.attachDataset(dataset.id)
+    await workspace.attachDataset(dataset.id).catch(() => undefined)
+    if (dataset.imported_datasets && Array.isArray(dataset.imported_datasets)) {
+      for (const extra of dataset.imported_datasets) {
+        if (extra.id && extra.id !== dataset.id) {
+          await workspace.attachDataset(extra.id).catch(() => undefined)
+        }
+      }
+    }
+    await workspace.refreshManifest().catch(() => undefined)
     setAddOpen(false)
     if (!dataset.is_georeferenced) {
-      const returnTo = `/datasets/${id}/workspace?view=database`
+      const returnTo = `/datasets/${id}/workspace?view=map`
       navigate(`/datasets/${dataset.id}/georeference?returnTo=${encodeURIComponent(returnTo)}`)
       return
     }
@@ -324,6 +363,12 @@ export default function WorkspacePage() {
             onReorder={(ids) => workspace.reorderMembers(ids).catch(() => undefined)}
             onDetach={handleDetach}
             onLayerChanged={() => workspace.refreshManifest().catch(() => undefined)}
+            onOpenTransform={(member) => {
+              setTransformingMember(member)
+              if (view !== "map") setView("map")
+            }}
+            activeFloorLevel={activeFloorLevel}
+            onSelectFloor={handleSelectFloor}
           />
         </div>
         {layersOpen && (
@@ -339,6 +384,13 @@ export default function WorkspacePage() {
               onDetach={handleDetach}
               onClose={() => setLayersOpen(false)}
               onLayerChanged={() => workspace.refreshManifest().catch(() => undefined)}
+              onOpenTransform={(member) => {
+                setTransformingMember(member)
+                setLayersOpen(false)
+                if (view !== "map") setView("map")
+              }}
+              activeFloorLevel={activeFloorLevel}
+              onSelectFloor={handleSelectFloor}
             />
           </div>
         )}
@@ -352,6 +404,13 @@ export default function WorkspacePage() {
               onSelectRecord={selectMapRecord}
               savedCamera={workspace.manifest.camera}
               onCameraChange={(camera) => workspace.updateState({ camera }).catch(() => undefined)}
+              transformMember={transformingMember}
+              onEndTransform={() => setTransformingMember(null)}
+              onTransformApplied={() => {
+                workspace.refreshManifest().catch(() => undefined)
+              }}
+              activeFloorLevel={activeFloorLevel}
+              onActiveFloorChange={setActiveFloorLevel}
             />
           ) : (
             <WorkspaceTable
@@ -426,7 +485,12 @@ export default function WorkspacePage() {
         </div>
       </nav>
 
-      <AddDatasetDialog open={addOpen} onClose={() => setAddOpen(false)} onUploaded={handleAddedDataset} />
+      <AddDatasetDialog
+        open={addOpen}
+        onClose={() => setAddOpen(false)}
+        onUploaded={handleAddedDataset}
+        existingMembers={workspace.manifest.members}
+      />
     </div>
   )
 }

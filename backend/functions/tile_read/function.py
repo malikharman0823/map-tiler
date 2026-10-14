@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from storage.session import RepositoryError, SessionRepository
 
 from config import settings
@@ -13,7 +13,7 @@ from schemas.error import ApplicationError
 logger = logging.getLogger(__name__)
 BACKEND_DIRECTORY = Path(__file__).resolve().parents[2]
 TILES_DIRECTORY = BACKEND_DIRECTORY / "storage" / "tiles"
-CACHE_CONTROL = "public, max-age=3600"
+CACHE_CONTROL = "no-cache, must-revalidate"
 
 
 def _application_error(
@@ -93,43 +93,26 @@ def _load_dataset(db: SessionRepository, request: TileReadRequest) -> Dataset:
     return dataset
 
 
-def _require_generated_tiles(dataset: Dataset) -> None:
-    if dataset.tile_status != "completed" or not dataset.tile_path:
-        raise _application_error(
-            status_code=404,
-            code="TILES_NOT_GENERATED",
-            message="Tiles have not been generated for this dataset.",
-            details="Generate tiles before requesting map tiles.",
-            field="dataset_id",
-        )
+def _require_generated_tiles(dataset: Dataset) -> bool:
+    return dataset.tile_status == "completed" and bool(dataset.tile_path)
 
 
-def _validate_zoom(dataset: Dataset, z: int) -> None:
+def _zoom_is_valid(dataset: Dataset, z: int) -> bool:
     below_minimum = dataset.tile_min_zoom is not None and z < dataset.tile_min_zoom
     above_maximum = dataset.tile_max_zoom is not None and z > dataset.tile_max_zoom
-    if below_minimum or above_maximum:
-        raise _application_error(
-            status_code=404,
-            code="ZOOM_NOT_AVAILABLE",
-            message="The requested zoom level is not available.",
-            details=(
-                "The requested tile is outside the generated zoom range for "
-                "this dataset."
-            ),
-            field="z",
-        )
+    return not (below_minimum or above_maximum)
 
 
-def _tile_path(dataset: Dataset, request: TileReadRequest) -> Path:
+def _tile_path(dataset: Dataset, request: TileReadRequest) -> Path | None:
     expected_root = (TILES_DIRECTORY / str(dataset.id)).resolve()
     if not dataset.tile_path:
-        raise _tile_read_error()
+        return None
     try:
         stored = Path(dataset.tile_path)
         stored_root = stored.resolve() if stored.is_absolute() else (BACKEND_DIRECTORY / stored).resolve()
     except (OSError, RuntimeError, TypeError):
         logger.exception("The stored tile directory could not be resolved.")
-        raise _tile_read_error()
+        return None
 
     sessions_root = Path(settings.session_storage_dir).resolve()
     is_valid_root = (
@@ -139,7 +122,7 @@ def _tile_path(dataset: Dataset, request: TileReadRequest) -> Path:
     )
     if not is_valid_root:
         logger.error("The stored tile directory is outside its dataset directory.")
-        raise _tile_read_error()
+        return None
 
     try:
         tile_path = (
@@ -151,37 +134,32 @@ def _tile_path(dataset: Dataset, request: TileReadRequest) -> Path:
         tile_path.relative_to(stored_root)
     except (OSError, RuntimeError, ValueError):
         logger.exception("The requested tile path could not be safely resolved.")
-        raise _tile_read_error()
+        return None
 
     try:
         tile_exists = tile_path.is_file()
     except OSError as exc:
         logger.exception("The requested tile could not be inspected.", exc_info=exc)
-        raise _tile_read_error() from exc
+        return None
 
     if not tile_exists:
-        raise _application_error(
-            status_code=404,
-            code="TILE_NOT_FOUND",
-            message="The requested tile was not found.",
-            details=(
-                "No generated tile exists for the supplied dataset and tile "
-                "coordinates."
-            ),
-            field="y",
-        )
+        return None
     return tile_path
 
 
 def read_tile(
     request: TileReadRequest,
     db: SessionRepository,
-) -> FileResponse:
+) -> FileResponse | Response:
     _validate_coordinates(request)
     dataset = _load_dataset(db, request)
-    _require_generated_tiles(dataset)
-    _validate_zoom(dataset, request.z)
+    if not _require_generated_tiles(dataset):
+        return Response(status_code=204, headers={"Cache-Control": CACHE_CONTROL})
+    if not _zoom_is_valid(dataset, request.z):
+        return Response(status_code=204, headers={"Cache-Control": CACHE_CONTROL})
     tile_path = _tile_path(dataset, request)
+    if tile_path is None:
+        return Response(status_code=204, headers={"Cache-Control": CACHE_CONTROL})
     return FileResponse(
         path=tile_path,
         media_type="image/png",

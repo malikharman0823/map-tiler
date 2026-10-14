@@ -180,6 +180,13 @@ def _member_data(
     control_count = len(db.list_control_points(member.dataset_id))
     icon_count = len(db.list_icon_points(member.dataset_id))
     name = member.alias or detail.filename
+    dataset_obj = db.get_dataset(member.dataset_id)
+    meta = (dataset_obj.extracted_metadata if dataset_obj else None) or {}
+    building_name = meta.get("building_name")
+    floor_level = meta.get("floor_level")
+    floor_label = meta.get("floor_label")
+    floor_role = meta.get("floor_role")
+    is_building_floor = bool(meta.get("is_building_floor") or building_name is not None)
     return WorkspaceMemberData(
         id=member.id,
         dataset_id=member.dataset_id,
@@ -215,6 +222,11 @@ def _member_data(
         dataset=detail,
         created_at=member.created_at,
         updated_at=member.updated_at,
+        building_name=building_name,
+        floor_level=floor_level,
+        floor_label=floor_label,
+        floor_role=floor_role,
+        is_building_floor=is_building_floor,
     )
 
 
@@ -340,8 +352,22 @@ def update_workspace_member(
         values = request.model_dump(exclude_unset=True)
         if "alias" in values and values["alias"] is not None:
             values["alias"] = values["alias"].strip() or None
+        meta_keys = {"building_name", "floor_level", "floor_label", "floor_role"}
+        has_meta = any(k in values for k in meta_keys)
+        if has_meta:
+            ds = db.get_dataset(member_dataset_id)
+            if ds is not None:
+                ds_meta = dict(ds.extracted_metadata or {})
+                for k in meta_keys:
+                    if k in values:
+                        ds_meta[k] = values.pop(k)
+                if ds_meta.get("building_name") or ds_meta.get("floor_level") is not None:
+                    ds_meta["is_building_floor"] = True
+                ds.extracted_metadata = ds_meta
+                db.save_dataset(ds)
         for name, value in values.items():
-            setattr(member, name, value)
+            if hasattr(member, name):
+                setattr(member, name, value)
         db.save_workspace_member(member)
         db.commit()
     except ApplicationError:

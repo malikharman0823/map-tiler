@@ -133,10 +133,32 @@ export default function useWorkspace(primaryDatasetId) {
     return operation
   }, [refreshMapRecords, refreshRecords])
 
-  const updateMember = useCallback((datasetId, patch) => runMutation(
-    () => patchWorkspaceMember(primaryDatasetId, datasetId, patch),
-    "Unable to save the layer settings.",
-  ), [primaryDatasetId, runMutation])
+  const updateMember = useCallback((datasetId, patch) => {
+    setManifest((current) => {
+      if (!current) return current
+      return {
+        ...current,
+        members: current.members.map((member) =>
+          member.dataset_id === datasetId ? { ...member, ...patch } : member
+        ),
+      }
+    })
+    setSaveState("saving")
+    const operation = mutationChainRef.current
+      .catch(() => undefined)
+      .then(() => patchWorkspaceMember(primaryDatasetId, datasetId, patch))
+      .then((nextManifest) => {
+        if (nextManifest) setManifest(nextManifest)
+        setSaveState("saved")
+      })
+      .catch((requestError) => {
+        setSaveState("failed")
+        setError(readableApiError(requestError, "Unable to save the layer settings."))
+        throw requestError
+      })
+    mutationChainRef.current = operation
+    return operation
+  }, [primaryDatasetId])
 
   const reorderMembers = useCallback((orderedDatasetIds) => runMutation(async () => {
     let nextManifest = manifest
@@ -157,7 +179,16 @@ export default function useWorkspace(primaryDatasetId) {
   ), [primaryDatasetId, runMutation])
 
   const attachDataset = useCallback((datasetId) => runMutation(
-    () => attachWorkspaceDataset(primaryDatasetId, datasetId),
+    async () => {
+      try {
+        return await attachWorkspaceDataset(primaryDatasetId, datasetId)
+      } catch (requestError) {
+        if (requestError?.response?.status === 409) {
+          return await getWorkspace(primaryDatasetId)
+        }
+        throw requestError
+      }
+    },
     "Unable to attach the dataset.",
   ), [primaryDatasetId, runMutation])
 

@@ -16,6 +16,7 @@ class UploadData(BaseModel):
     message: str
     is_georeferenced: bool = False
     georeference_status: str = "not_started"
+    imported_datasets: list[dict[str, Any]] | None = None
 
 
 class UploadResponse(BaseModel):

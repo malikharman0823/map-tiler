@@ -443,6 +443,7 @@ def _calculate(
     points: list[ControlPoint],
     requested_transformation: str,
     target_crs: CRS,
+    db: SessionRepository | None = None,
 ) -> GeoreferenceCalculation:
     try:
         with rasterio.open(source_path) as source:
@@ -466,6 +467,23 @@ def _calculate(
             f"{len(points)} points require the {transformation} transformation.",
             "transformation",
         )
+
+    if (
+        width > 1
+        and height > 1
+        and points
+        and all(0.0 <= p.image_x <= 1.0 for p in points)
+        and all(0.0 <= p.image_y <= 1.0 for p in points)
+    ):
+        for p in points:
+            p.image_x = p.image_x * width
+            p.image_y = p.image_y * height
+            if db is not None:
+                try:
+                    db.save_control_point(p)
+                except Exception:
+                    pass
+
     _validate_points(points, width=width, height=height)
     _validate_distribution(points, width=width, height=height)
     parameters = (
@@ -497,6 +515,8 @@ def _write_raster(
         temporary_path.unlink(missing_ok=True)
         with rasterio.open(source_path) as source:
             profile = source.profile.copy()
+            for key in ("photometric", "compress", "interleave", "blockxsize", "blockysize", "tiled", "nodata"):
+                profile.pop(key, None)
             profile.update(
                 driver="GTiff",
                 width=source.width,
@@ -504,6 +524,10 @@ def _write_raster(
                 count=source.count,
                 crs=calculation.target_crs,
                 transform=calculation.raster_transform,
+                tiled=True,
+                blockxsize=256,
+                blockysize=256,
+                compress="deflate",
             )
             with rasterio.open(temporary_path, "w", **profile) as destination:
                 for i in range(1, source.count + 1):
@@ -532,6 +556,7 @@ def _response_data(
     reusable: bool = False,
     reuse_warning: str | None = None,
     message: str,
+    propagated_sibling_ids: list[UUID] | None = None,
 ) -> GeoreferenceData:
     return GeoreferenceData(
         dataset_id=dataset_id,
@@ -552,7 +577,57 @@ def _response_data(
         created_at=None if config is None else config.created_at,
         updated_at=None if config is None else config.updated_at,
         message=message,
+        propagated_sibling_ids=propagated_sibling_ids or [],
     )
+
+
+def _propagate_building_georeference(
+    primary_dataset: Dataset,
+    calculation: GeoreferenceCalculation,
+    points: list[ControlPoint],
+    db: SessionRepository,
+) -> list[UUID]:
+    meta = primary_dataset.extracted_metadata or {}
+    building_name = meta.get("building_name")
+    if not building_name or not meta.get("is_building_floor"):
+        return []
+
+    propagated: list[UUID] = []
+    for sibling in db.list_datasets():
+        if sibling.id == primary_dataset.id:
+            continue
+        sib_meta = sibling.extracted_metadata or {}
+        if sib_meta.get("building_name") == building_name and sib_meta.get("is_building_floor"):
+            try:
+                sibling_source = _source_path(sibling)
+                sibling_output = _output_path(sibling.id, db)
+                sibling_relative = _relative_output_path(sibling.id, db)
+                _write_raster(sibling_source, sibling_output, calculation)
+                sibling.georeference_status = "completed"
+                sibling.georeferenced_path = sibling_relative
+                sibling.process_status = "not_started"
+                sibling.tile_status = "not_started"
+                db.save_dataset(sibling)
+                _upsert_config(db, sibling, calculation, len(points), sibling_relative)
+
+                db.save_control_points(
+                    sibling.id,
+                    [
+                        ControlPoint(
+                            dataset_id=sibling.id,
+                            image_x=pt.image_x,
+                            image_y=pt.image_y,
+                            longitude=pt.longitude,
+                            latitude=pt.latitude,
+                        )
+                        for pt in points
+                    ],
+                )
+                propagated.append(sibling.id)
+            except Exception as exc:
+                logger.exception("Failed to propagate georeference to sibling %s", sibling.id, exc_info=exc)
+    db.commit()
+    return propagated
 
 
 def _upsert_config(
@@ -643,7 +718,7 @@ def georeference_dataset(
     points = _load_control_points(db, dataset.id)
     source_path = _source_path(dataset)
     calculation = _calculate(
-        source_path, points, request.transformation, target_crs
+        source_path, points, request.transformation, target_crs, db
     )
 
     if request.action == "calculate":
@@ -709,7 +784,8 @@ def georeference_dataset(
         ) from exc
     if backup is not None:
         backup.unlink(missing_ok=True)
-    _output_path(dataset.id, preview=True).unlink(missing_ok=True)
+    _output_path(dataset.id, db, preview=True).unlink(missing_ok=True)
+    propagated = _propagate_building_georeference(dataset, calculation, points, db)
     return GeoreferenceResponse(
         data=_response_data(
             dataset.id,
@@ -720,6 +796,7 @@ def georeference_dataset(
             point_count=len(points),
             reusable=True,
             message="Georeference saved successfully.",
+            propagated_sibling_ids=propagated,
         )
     )
 

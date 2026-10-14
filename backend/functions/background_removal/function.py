@@ -251,12 +251,14 @@ def handle_background_removal(
     current_bg = meta.get("background_removal", {})
 
     # Check for identical duplicate request
+    has_tiles = tiles_dir.is_dir() and any(tiles_dir.iterdir())
     if (
         current_bg.get("enabled")
         and current_bg.get("color") == request.color
         and current_bg.get("threshold") == request.threshold
         and current_bg.get("edge_softness") == request.edge_softness
         and processed_tif.is_file()
+        and has_tiles
     ):
         return BackgroundRemovalResponse(
             data=BackgroundRemovalData(
@@ -324,6 +326,19 @@ def handle_background_removal(
                 field="threshold",
             ) from exc
 
+        rel_processed = (
+            processed_tif.relative_to(BACKEND_DIRECTORY).as_posix()
+            if processed_tif.is_relative_to(BACKEND_DIRECTORY)
+            else processed_tif.as_posix()
+        )
+        dataset.processed_path = rel_processed
+        dataset.process_status = "completed"
+        try:
+            db.save_dataset(dataset)
+            db.commit()
+        except RepositoryError:
+            pass
+
         # Regenerate map tiles from the new transparent RGBA GeoTIFF
         try:
             generate_tiles(
@@ -333,6 +348,7 @@ def handle_background_removal(
                     max_zoom=dataset.tile_max_zoom or 18,
                 ),
                 db,
+                force=True,
             )
         except Exception as exc:
             logger.exception("Failed to regenerate tiles after background removal.", exc_info=exc)

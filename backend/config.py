@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     max_total_temporary_storage_bytes: int = 5 * 1024 * 1024 * 1024  # 5 GB total
 
     export_retention_seconds: int = 3600  # 1 hour
-    restore_sessions_on_startup: bool = False
+    restore_sessions_on_startup: bool = True
 
     model_config = SettingsConfigDict(
         env_file=ENV_FILE,

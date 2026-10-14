@@ -30,6 +30,11 @@ class WorkspaceMemberData(BaseModel):
     dataset: DatasetDetailData
     created_at: datetime
     updated_at: datetime
+    building_name: str | None = None
+    floor_level: int | None = None
+    floor_label: str | None = None
+    floor_role: str | None = None
+    is_building_floor: bool = False
 
 
 class WorkspaceCamera(BaseModel):
@@ -58,7 +63,7 @@ class WorkspaceManifestResponse(BaseModel):
 
 class WorkspaceRecordBase(BaseModel):
     id: str
-    kind: str
+    kind: Any
     member_id: UUID
     dataset_id: UUID
     dataset_name: str
@@ -71,7 +76,7 @@ class WorkspaceRecordBase(BaseModel):
 
 
 class RasterWorkspaceRecord(WorkspaceRecordBase):
-    kind: Literal["raster"] = "raster"
+    kind: Literal["raster"] = "raster"  # pyright: ignore[reportIncompatibleVariableOverride] # type: ignore[override]
     georeferenced_path: str | None = None
     crs: str | None = None
     bounds: list[float] | dict[str, float] | None = None
@@ -82,7 +87,7 @@ class RasterWorkspaceRecord(WorkspaceRecordBase):
 
 
 class ControlPointWorkspaceRecord(WorkspaceRecordBase):
-    kind: Literal["control_point"] = "control_point"
+    kind: Literal["control_point"] = "control_point"  # pyright: ignore[reportIncompatibleVariableOverride] # type: ignore[override]
     pair_number: int
     image_x: float
     image_y: float
@@ -92,7 +97,7 @@ class ControlPointWorkspaceRecord(WorkspaceRecordBase):
 
 
 class IconPointWorkspaceRecord(WorkspaceRecordBase):
-    kind: Literal["icon_point"] = "icon_point"
+    kind: Literal["icon_point"] = "icon_point"  # pyright: ignore[reportIncompatibleVariableOverride] # type: ignore[override]
     icon_key: str | None = None
     description: str | None = None
     longitude: float

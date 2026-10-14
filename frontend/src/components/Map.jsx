@@ -384,9 +384,13 @@ export default function Map({
     }
 
     const existingSource = map.getSource(DATASET_SOURCE_ID)
-    if (existingSource?.setTiles) {
-      existingSource.setTiles([tileUrl])
-    } else if (!existingSource) {
+    const currentTileUrl = existingSource?._currentTileUrl
+    if (existingSource && currentTileUrl && currentTileUrl !== tileUrl) {
+      if (map.getLayer(DATASET_LAYER_ID)) map.removeLayer(DATASET_LAYER_ID)
+      map.removeSource(DATASET_SOURCE_ID)
+    }
+
+    if (!map.getSource(DATASET_SOURCE_ID)) {
       const sourceOptions = {
         type: "raster",
         tiles: [tileUrl],
@@ -399,6 +403,14 @@ export default function Map({
         sourceOptions.bounds = targetBounds
       }
       map.addSource(DATASET_SOURCE_ID, sourceOptions)
+      const added = map.getSource(DATASET_SOURCE_ID)
+      if (added) added._currentTileUrl = tileUrl
+    } else {
+      const src = map.getSource(DATASET_SOURCE_ID)
+      if (src) {
+        src._currentTileUrl = tileUrl
+        if (src.setTiles) src.setTiles([tileUrl])
+      }
     }
     if (map.getSource(DATASET_SOURCE_ID) && !map.getLayer(DATASET_LAYER_ID)) {
       const firstPointLayer = [CONTROL_POINTS_LAYER_ID, ICON_POINTS_LAYER_ID]

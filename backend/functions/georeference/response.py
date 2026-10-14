@@ -24,6 +24,7 @@ class GeoreferenceData(BaseModel):
     created_at: datetime | None = None
     updated_at: datetime | None = None
     message: str
+    propagated_sibling_ids: list[UUID] = []
 
 
 class GeoreferenceResponse(BaseModel):

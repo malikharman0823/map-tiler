@@ -1,10 +1,12 @@
 import hashlib
+import json
 import logging
 from pathlib import Path, PurePosixPath
+import re
 import shutil
 import stat
 import tempfile
-from typing import BinaryIO, cast
+from typing import Any, BinaryIO, cast
 from uuid import uuid4
 import zipfile
 
@@ -32,16 +34,24 @@ UPLOAD_DIRECTORY = BACKEND_DIRECTORY / "storage" / "uploads"
 COPY_CHUNK_SIZE = 1024 * 1024
 MAX_ARCHIVE_ENTRIES = 50000
 MAX_COMPRESSION_RATIO = 200
-RASTER_SUFFIXES = {".png", ".jpg", ".jpeg"}
+RASTER_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".webp", ".bmp"}
 WORLD_SUFFIXES = {
     ".png": {".pgw", ".wld"},
     ".jpg": {".jgw", ".jpw", ".wld"},
     ".jpeg": {".jgw", ".jpw", ".wld"},
+    ".tif": {".tfw", ".wld"},
+    ".tiff": {".tfw", ".wld"},
+    ".webp": {".wld"},
+    ".bmp": {".bpw", ".wld"},
 }
 CONTENT_TYPES = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
 }
 
 
@@ -191,72 +201,120 @@ def _is_preview_or_thumb(name: str) -> bool:
 
 def _select_bundle_entries(
     entries: dict[str, zipfile.ZipInfo],
-) -> tuple[str, list[str]]:
-    raster_names = [
+) -> list[tuple[str, list[str]]]:
+    all_raster_names = [
         name for name in entries if PurePosixPath(name).suffix.lower() in RASTER_SUFFIXES
     ]
-    if not raster_names:
+    if not all_raster_names:
         raise _error(
             "RASTER_NOT_FOUND",
             "The ZIP does not contain a supported raster.",
-            "Include exactly one PNG, JPEG, TIFF, or GeoTIFF.",
+            "Include one or more PNG, JPEG, TIFF, or GeoTIFF files.",
         )
-    if len(raster_names) > 1:
-        tiff_candidates = [
-            n for n in raster_names
-            if PurePosixPath(n).suffix.lower() in {".tif", ".tiff"} and not _is_preview_or_thumb(n)
-        ]
-        non_preview_candidates = [
-            n for n in raster_names if not _is_preview_or_thumb(n)
-        ]
-        if len(tiff_candidates) == 1:
-            raster_names = tiff_candidates
-        elif len(non_preview_candidates) == 1:
-            raster_names = non_preview_candidates
 
-    if len(raster_names) != 1:
-        raise _error(
-            "AMBIGUOUS_RASTER_BUNDLE",
-            "The ZIP contains multiple raster candidates.",
-            "Create one ZIP per raster dataset.",
-        )
-    raster_name = raster_names[0]
-    raster_path = PurePosixPath(raster_name)
-    allowed_world = WORLD_SUFFIXES.get(raster_path.suffix.lower(), set())
+    non_previews = [n for n in all_raster_names if not _is_preview_or_thumb(n)]
+    candidate_rasters = non_previews if non_previews else all_raster_names
 
-    selected = [raster_name]
-    world_files: list[str] = []
-    prj_files: list[str] = []
-    for name in entries:
-        if name == raster_name:
-            continue
-        path = PurePosixPath(name)
-        same_source = (
-            path.parent == raster_path.parent
-            and path.stem.casefold() == raster_path.stem.casefold()
-        )
-        suffix = path.suffix.lower()
-        if same_source and suffix in allowed_world:
-            world_files.append(name)
-        elif same_source and suffix == ".prj":
-            prj_files.append(name)
-        elif _is_preview_or_thumb(name):
-            selected.append(name)
-        else:
-            raise _error(
-                "UNSUPPORTED_RASTER_BUNDLE_CONTENT",
-                "The ZIP contains files outside the raster bundle.",
-                "Include one raster and only its matching world-file or .prj sidecars.",
+    bundles: list[tuple[str, list[str]]] = []
+    accounted_files: set[str] = set()
+
+    for raster_name in candidate_rasters:
+        raster_path = PurePosixPath(raster_name)
+        allowed_world = WORLD_SUFFIXES.get(raster_path.suffix.lower(), set())
+
+        selected = [raster_name]
+        world_files: list[str] = []
+        prj_files: list[str] = []
+
+        for name in entries:
+            if name == raster_name or name in candidate_rasters:
+                continue
+            path = PurePosixPath(name)
+            same_source = (
+                path.parent == raster_path.parent
+                and path.stem.casefold() == raster_path.stem.casefold()
             )
-    if len(world_files) > 1 or len(prj_files) > 1:
-        raise _error(
-            "AMBIGUOUS_RASTER_SIDECARS",
-            "The ZIP contains duplicate georeference sidecars.",
-            "Include at most one matching world file and one matching .prj file.",
-        )
-    selected.extend(world_files)
-    selected.extend(prj_files)
-    return raster_name, selected
+            suffix = path.suffix.lower()
+            if same_source and suffix in allowed_world:
+                world_files.append(name)
+            elif same_source and suffix == ".prj":
+                prj_files.append(name)
+
+        if len(world_files) > 1 or len(prj_files) > 1:
+            raise _error(
+                "AMBIGUOUS_RASTER_SIDECARS",
+                "The ZIP contains duplicate georeference sidecars.",
+                "Include at most one matching world file and one matching .prj file per raster.",
+            )
+
+        selected.extend(world_files)
+        selected.extend(prj_files)
+        accounted_files.update(selected)
+        bundles.append((raster_name, selected))
+
+    # Auxiliary files like manifest.json, README.txt, and documentation
+    # do not prevent valid rasters from loading.
+    return bundles
+
+
+def _extract_floor_info(raster_name: str, manifest_data: dict, bundle_filename: str) -> dict[str, Any]:
+    file_basename = PurePosixPath(raster_name).name.lower()
+    floors = manifest_data.get("floors", []) if isinstance(manifest_data, dict) else []
+    rec_group = manifest_data.get("recommended_grouping", {}) if isinstance(manifest_data, dict) else {}
+    bundle_stem = PurePosixPath(bundle_filename).stem.replace("_", " ").title() if bundle_filename else "Building"
+    building_name = (
+        rec_group.get("building_name")
+        or (manifest_data.get("project") if isinstance(manifest_data, dict) else None)
+        or bundle_stem
+    )
+
+    for f in floors:
+        if isinstance(f, dict) and PurePosixPath(f.get("filename", "")).name.lower() == file_basename:
+            return {
+                "building_name": building_name,
+                "floor_level": int(f.get("level", 0)),
+                "floor_label": str(f.get("label") or f.get("filename", "")),
+                "floor_role": str(f.get("role", "")),
+                "is_building_floor": True,
+            }
+
+    stem = PurePosixPath(raster_name).stem.lower()
+    b_match = re.search(r'(?:basement[_-]?|b)(\d+)', stem)
+    if b_match:
+        lvl = -int(b_match.group(1))
+        return {
+            "building_name": building_name,
+            "floor_level": lvl,
+            "floor_label": f"BASEMENT {b_match.group(1)}",
+            "floor_role": "parking",
+            "is_building_floor": True,
+        }
+    if "ground" in stem or stem in {"g", "l0", "floor_0"}:
+        return {
+            "building_name": building_name,
+            "floor_level": 0,
+            "floor_label": "GROUND FLOOR",
+            "floor_role": "lobby",
+            "is_building_floor": True,
+        }
+    f_match = re.search(r'(?:floor[_-]?|level[_-]?|fl[_-]?|l)(\d+)', stem)
+    if f_match:
+        lvl = int(f_match.group(1))
+        return {
+            "building_name": building_name,
+            "floor_level": lvl,
+            "floor_label": f"FLOOR {lvl}",
+            "floor_role": "office",
+            "is_building_floor": True,
+        }
+
+    return {
+        "building_name": building_name if len(floors) > 1 else None,
+        "floor_level": 0,
+        "floor_label": PurePosixPath(raster_name).stem.replace("_", " ").title(),
+        "floor_role": None,
+        "is_building_floor": bool(floors),
+    }
 
 
 def _extract_selected(
@@ -405,119 +463,204 @@ async def import_raster_zip(
         try:
             with zipfile.ZipFile(package_path, "r") as archive:
                 entries = _archive_entries(archive)
-                raster_name, selected = _select_bundle_entries(entries)
-                staged_directory = temporary_root / "dataset"
-                extracted = _extract_selected(
-                    archive,
-                    entries,
-                    selected,
-                    staged_directory,
-                )
+                manifest_data = {}
+                for entry_name in entries:
+                    if PurePosixPath(entry_name).name.lower() == "manifest.json":
+                        try:
+                            manifest_data = json.loads(archive.read(entries[entry_name]).decode("utf-8"))
+                        except Exception:
+                            pass
+                        break
+                bundles = _select_bundle_entries(entries)
+                imported_datasets: list[Dataset] = []
+                any_existing = False
+
+                for idx, (raster_name, selected) in enumerate(bundles):
+                    staged_directory = temporary_root / f"dataset_{idx}"
+                    extracted = _extract_selected(
+                        archive,
+                        entries,
+                        selected,
+                        staged_directory,
+                    )
+                    staged_raster = extracted[raster_name]
+                    file_hash = await run_in_threadpool(_file_hash, staged_raster)
+
+                    try:
+                        existing = db.find_dataset_by_hash(file_hash)
+                    except RepositoryError as exc:
+                        raise ApplicationError(
+                            status_code=500,
+                            code="DATABASE_ERROR",
+                            message="The raster bundle could not be checked.",
+                            details="The database lookup failed.",
+                        ) from exc
+
+                    if existing is not None:
+                        imported_datasets.append(existing)
+                        any_existing = True
+                        continue
+
+                    suffix = staged_raster.suffix.lower()
+                    format_name = "tiff" if suffix in {".tif", ".tiff"} else suffix.lstrip(".")
+                    metadata_response = await extract_metadata(
+                        MetadataRequest(
+                            file_path=str(staged_raster),
+                            format=format_name,
+                            category="raster",
+                        )
+                    )
+                    metadata = _apply_sidecar_metadata(
+                        dict(metadata_response.data.metadata),
+                        staged_raster,
+                        list(extracted.values()),
+                    )
+                    metadata["format"] = metadata_response.data.format
+                    metadata["category"] = "raster"
+                    metadata["bundle_filename"] = validated_file.filename
+                    floor_info = _extract_floor_info(raster_name, manifest_data, validated_file.filename or "")
+                    metadata["building_name"] = floor_info["building_name"]
+                    metadata["floor_level"] = floor_info["floor_level"]
+                    metadata["floor_label"] = floor_info["floor_label"]
+                    metadata["floor_role"] = floor_info["floor_role"]
+                    metadata["is_building_floor"] = floor_info["is_building_floor"]
+                    is_georeferenced = bool(metadata.get("crs") and metadata.get("transform"))
+
+                    dataset_id = uuid4()
+                    is_default_upload_dir = UPLOAD_DIRECTORY == BACKEND_DIRECTORY / "storage" / "uploads"
+                    if is_default_upload_dir and hasattr(db, "get_source_dir") and hasattr(db, "session_dir"):
+                        dataset_directory = db.get_source_dir(dataset_id)
+                        stored_raster = dataset_directory / staged_raster.name
+                        try:
+                            relative_path = stored_raster.relative_to(BACKEND_DIRECTORY).as_posix()
+                        except ValueError:
+                            relative_path = stored_raster.as_posix()
+                    else:
+                        dataset_directory = UPLOAD_DIRECTORY / str(dataset_id)
+                        stored_raster = dataset_directory / staged_raster.name
+                        relative_path = (
+                            Path("storage") / "uploads" / str(dataset_id) / staged_raster.name
+                        ).as_posix()
+
+                    try:
+                        dataset_directory.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(staged_directory), str(dataset_directory))
+                    except OSError as exc:
+                        if dataset_directory.exists():
+                            shutil.rmtree(dataset_directory, ignore_errors=True)
+                        raise ApplicationError(
+                            status_code=500,
+                            code="FILE_SAVE_ERROR",
+                            message="The raster bundle could not be saved.",
+                            details="The server could not move the validated bundle into managed storage.",
+                            field="file",
+                        ) from exc
+
+                    content_type = CONTENT_TYPES.get(suffix, "image/png" if suffix == ".png" else "application/octet-stream")
+                    dataset = Dataset(
+                        id=dataset_id,
+                        filename=stored_raster.name,
+                        file_size=stored_raster.stat().st_size,
+                        content_type=content_type,
+                        file_hash=file_hash,
+                        storage_path=relative_path,
+                        extracted_metadata=metadata,
+                        georeferenced_path=relative_path if is_georeferenced else None,
+                        georeference_status="completed" if is_georeferenced else "not_started",
+                    )
+                    try:
+                        db.insert_dataset(dataset)
+                        db.commit()
+                    except DuplicateValueError:
+                        db.rollback()
+                        shutil.rmtree(dataset_directory, ignore_errors=True)
+                        existing = db.find_dataset_by_hash(file_hash)
+                        if existing is not None:
+                            imported_datasets.append(existing)
+                            any_existing = True
+                            continue
+                        raise
+                    except RepositoryError as exc:
+                        db.rollback()
+                        shutil.rmtree(dataset_directory, ignore_errors=True)
+                        raise ApplicationError(
+                            status_code=500,
+                            code="DATABASE_ERROR",
+                            message="The raster bundle could not be registered.",
+                            details="The database operation failed.",
+                        ) from exc
+
+                    if is_georeferenced:
+                        _schedule_processing(background_tasks, dataset.id, getattr(db, "session_id", None))
+
+                    imported_datasets.append(dataset)
+
         except zipfile.BadZipFile as exc:
             raise _error(
                 "INVALID_RASTER_ARCHIVE",
                 "The uploaded file is not a readable ZIP.",
-                "Create a standard ZIP containing one raster dataset.",
+                "Create a standard ZIP containing raster datasets.",
             ) from exc
 
-        staged_raster = extracted[raster_name]
-        file_hash = await run_in_threadpool(_file_hash, staged_raster)
-        try:
-            existing = db.find_dataset_by_hash(file_hash)
-        except RepositoryError as exc:
-            raise ApplicationError(
-                status_code=500,
-                code="DATABASE_ERROR",
-                message="The raster bundle could not be checked.",
-                details="The database lookup failed.",
-            ) from exc
-        if existing is not None:
-            return _build_upload_response(existing, existing=True)
-
-        suffix = staged_raster.suffix.lower()
-        format_name = "tiff" if suffix in {".tif", ".tiff"} else suffix.lstrip(".")
-        metadata_response = await extract_metadata(
-            MetadataRequest(
-                file_path=str(staged_raster),
-                format=format_name,
-                category="raster",
-            )
+    if not imported_datasets:
+        raise _error(
+            "RASTER_NOT_FOUND",
+            "No valid raster datasets could be imported from the archive.",
+            "Verify the archive contains supported raster files.",
         )
-        metadata = _apply_sidecar_metadata(
-            dict(metadata_response.data.metadata),
-            staged_raster,
-            list(extracted.values()),
-        )
-        metadata["format"] = metadata_response.data.format
-        metadata["category"] = "raster"
-        metadata["bundle_filename"] = validated_file.filename
-        is_georeferenced = bool(metadata.get("crs") and metadata.get("transform"))
 
-        dataset_id = uuid4()
-        is_default_upload_dir = UPLOAD_DIRECTORY == BACKEND_DIRECTORY / "storage" / "uploads"
-        if is_default_upload_dir and hasattr(db, "get_source_dir") and hasattr(db, "session_dir"):
-            dataset_directory = db.get_source_dir(dataset_id)
-            stored_raster = dataset_directory / staged_raster.name
-            try:
-                relative_path = stored_raster.relative_to(BACKEND_DIRECTORY).as_posix()
-            except ValueError:
-                relative_path = stored_raster.as_posix()
-        else:
-            dataset_directory = UPLOAD_DIRECTORY / str(dataset_id)
-            stored_raster = dataset_directory / staged_raster.name
-            relative_path = (
-                Path("storage") / "uploads" / str(dataset_id) / staged_raster.name
-            ).as_posix()
-        try:
-            dataset_directory.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(staged_directory), str(dataset_directory))
-        except OSError as exc:
-            if dataset_directory.exists():
-                shutil.rmtree(dataset_directory, ignore_errors=True)
-            raise ApplicationError(
-                status_code=500,
-                code="FILE_SAVE_ERROR",
-                message="The raster bundle could not be saved.",
-                details="The server could not move the validated bundle into managed storage.",
-                field="file",
-            ) from exc
+    if any((d.extracted_metadata or {}).get("is_building_floor") for d in imported_datasets):
+        imported_datasets.sort(key=lambda d: (d.extracted_metadata or {}).get("floor_level", 0))
 
-        dataset = Dataset(
-            id=dataset_id,
-            filename=stored_raster.name,
-            file_size=stored_raster.stat().st_size,
-            content_type=CONTENT_TYPES[suffix],
-            file_hash=file_hash,
-            storage_path=relative_path,
-            extracted_metadata=metadata,
-            georeferenced_path=relative_path if is_georeferenced else None,
-            georeference_status="completed" if is_georeferenced else "not_started",
-        )
+    primary = next(
+        (d for d in imported_datasets if (d.extracted_metadata or {}).get("floor_level") == 0),
+        imported_datasets[0],
+    )
+
+    if len(imported_datasets) > 1:
         try:
-            db.insert_dataset(dataset)
+            from functions.workspace.function import _load_project, attach_workspace_member
+            from functions.workspace.request import WorkspaceMemberCreateRequest
+            project = _load_project(primary.id, db)
+            b_name = (primary.extracted_metadata or {}).get("building_name")
+            if b_name:
+                project.name = b_name
+                db.save_map_project(project)
+
+            primary_mem = db.get_workspace_member(project.id, primary.id)
+            if primary_mem:
+                primary_mem.alias = (primary.extracted_metadata or {}).get("floor_label") or primary.filename
+                primary_mem.sort_order = (primary.extracted_metadata or {}).get("floor_level", 0)
+                db.save_workspace_member(primary_mem)
+
+            for extra in imported_datasets:
+                if extra.id != primary.id:
+                    try:
+                        attach_workspace_member(
+                            primary.id,
+                            WorkspaceMemberCreateRequest(dataset_id=extra.id),
+                            db,
+                        )
+                        extra_mem = db.get_workspace_member(project.id, extra.id)
+                        if extra_mem:
+                            extra_mem.alias = (extra.extracted_metadata or {}).get("floor_label") or extra.filename
+                            extra_mem.sort_order = (extra.extracted_metadata or {}).get("floor_level", 0)
+                            db.save_workspace_member(extra_mem)
+                    except Exception:
+                        pass
             db.commit()
-        except DuplicateValueError as exc:
-            db.rollback()
-            shutil.rmtree(dataset_directory, ignore_errors=True)
-            existing = db.find_dataset_by_hash(file_hash)
-            if existing is not None:
-                return _build_upload_response(existing, existing=True)
-            raise ApplicationError(
-                status_code=500,
-                code="DATABASE_ERROR",
-                message="The raster bundle could not be registered.",
-                details="A conflicting dataset record could not be recovered.",
-            ) from exc
-        except RepositoryError as exc:
-            db.rollback()
-            shutil.rmtree(dataset_directory, ignore_errors=True)
-            raise ApplicationError(
-                status_code=500,
-                code="DATABASE_ERROR",
-                message="The raster bundle could not be registered.",
-                details="The database operation failed.",
-            ) from exc
+        except Exception:
+            pass
 
-    if is_georeferenced:
-        _schedule_processing(background_tasks, dataset.id, getattr(db, "session_id", None))
-    return _build_upload_response(dataset, existing=False)
+    count = len(imported_datasets)
+    message = (
+        f"Imported {count} raster datasets successfully."
+        if count > 1
+        else ("This file already exists." if any_existing else "File uploaded successfully.")
+    )
+    return _build_upload_response(
+        primary,
+        existing=(count == 1 and any_existing),
+        message=message,
+        imported_datasets=imported_datasets,
+    )

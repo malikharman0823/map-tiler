@@ -9,7 +9,7 @@ from uuid import UUID
 from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, Query, Request, UploadFile
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from config import settings
@@ -136,6 +136,12 @@ from functions.background_removal.function import (
     get_background_removal_status,
     handle_background_removal,
 )
+from functions.raster_transform.request import RasterTransformRequest
+from functions.raster_transform.response import RasterTransformResponse
+from functions.raster_transform.function import (
+    get_raster_transform_status,
+    handle_raster_transform,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -200,6 +206,21 @@ async def application_error_handler(
         message=exc.message,
         details=exc.details,
         field=exc.field,
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(
+    request: Request,
+    exc: Exception,
+) -> JSONResponse:
+    logger.exception("Unhandled server error: %s", exc)
+    return make_error_response(
+        status_code=500,
+        code="INTERNAL_SERVER_ERROR",
+        message="An internal server error occurred.",
+        details=str(exc),
+        field=None,
     )
 
 
@@ -609,6 +630,29 @@ def post_dataset_background_removal(
     return handle_background_removal(dataset_id, request, db)
 
 
+@app.get(
+    "/datasets/{dataset_id}/transform",
+    response_model=RasterTransformResponse,
+)
+def get_dataset_transform(
+    dataset_id: UUID,
+    db: SessionRepository = Depends(get_session_repository),
+) -> RasterTransformResponse:
+    return get_raster_transform_status(dataset_id, db)
+
+
+@app.post(
+    "/datasets/{dataset_id}/transform",
+    response_model=RasterTransformResponse,
+)
+def post_dataset_transform(
+    dataset_id: UUID,
+    request: RasterTransformRequest,
+    db: SessionRepository = Depends(get_session_repository),
+) -> RasterTransformResponse:
+    return handle_raster_transform(dataset_id, request, db)
+
+
 @app.post(
     "/datasets/{dataset_id}/control-points",
     response_model=ControlPointResponse,
@@ -705,6 +749,26 @@ def georeference_raster_dataset(
             ),
             db,
         )
+        for sibling_id in getattr(response.data, "propagated_sibling_ids", []):
+            try:
+                process_raster(
+                    RasterProcessRequest(
+                        dataset_id=sibling_id,
+                        target_crs="EPSG:3857",
+                        resampling="bilinear",
+                    ),
+                    db,
+                )
+                generate_tiles(
+                    TileGenerationRequest(
+                        dataset_id=sibling_id,
+                        min_zoom=0,
+                        max_zoom=18,
+                    ),
+                    db,
+                )
+            except Exception as sibling_exc:
+                logger.warning("Failed to publish tiles for sibling floor %s: %s", sibling_id, sibling_exc)
     except ApplicationError:
         mark_georeference_publication_failed(dataset_id, db)
         raise
@@ -809,7 +873,7 @@ def generate_dataset_tiles(
 
 @app.get(
     "/datasets/{dataset_id}/tiles/{z}/{x}/{y}.png",
-    response_class=FileResponse,
+    response_class=Response,
     responses=TILE_READ_RESPONSES,
 )
 def read_dataset_tile(
@@ -818,7 +882,7 @@ def read_dataset_tile(
     x: int,
     y: int,
     db: SessionRepository = Depends(get_session_repository),
-) -> FileResponse:
+) -> Response:
     return read_tile(
         TileReadRequest(dataset_id=dataset_id, z=z, x=x, y=y),
         db,
@@ -976,26 +1040,3 @@ def get_dataset_workspace_records(
         sort=sort,
         order=order,
     )
-
-
-@app.post(
-    "/datasets/{dataset_id}/background-removal",
-    response_model=BackgroundRemovalResponse,
-)
-def post_background_removal(
-    dataset_id: UUID,
-    request: BackgroundRemovalRequest,
-    db: SessionRepository = Depends(get_session_repository),
-) -> BackgroundRemovalResponse:
-    return handle_background_removal(dataset_id, request, db)
-
-
-@app.get(
-    "/datasets/{dataset_id}/background-removal",
-    response_model=BackgroundRemovalResponse,
-)
-def get_background_removal(
-    dataset_id: UUID,
-    db: SessionRepository = Depends(get_session_repository),
-) -> BackgroundRemovalResponse:
-    return get_background_removal_status(dataset_id, db)

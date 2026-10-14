@@ -349,6 +349,11 @@ class BackgroundRemovalTests(unittest.TestCase):
         self.assertTrue(apply_resp.data.enabled)
         self.assertEqual(apply_resp.data.status, "completed")
         self.assertIsNotNone(apply_resp.data.tile_url_template)
+        self.assertNotEqual(
+            tile_file.read_bytes(),
+            b"dummy_original_tile",
+            "Applying background removal must rebuild the map tiles from the RGBA raster.",
+        )
 
         # Verify processed.tif is now 4-band RGBA
         with rasterio.open(processed_tif) as p_out:

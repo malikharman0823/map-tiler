@@ -329,7 +329,10 @@ export default function GeoreferencePage() {
         <div className="error-panel mx-auto max-w-2xl" role="alert">
           <p className="font-semibold">{error?.message || "Dataset unavailable"}</p>
           <p className="mt-2 text-[14px] text-muted">{error?.details}</p>
-          <Link className="text-action mt-5" to="/">Back to datasets</Link>
+          <div className="mt-5 flex items-center gap-4">
+            {returnTo && <Link className="text-action" to={returnTo}>Back to workspace</Link>}
+            <Link className="text-action" to="/">Back to datasets</Link>
+          </div>
         </div>
       </main>
     )

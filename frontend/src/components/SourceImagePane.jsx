@@ -67,8 +67,9 @@ export default function SourceImagePane({
   const [view, setView] = useState({ zoom: 1, panX: 0, panY: 0 })
   const [imageReady, setImageReady] = useState(false)
   const [cursorCoordinate, setCursorCoordinate] = useState(null)
-  const sourceWidth = Number(imageSize?.width) || 1
-  const sourceHeight = Number(imageSize?.height) || 1
+  const [naturalSize, setNaturalSize] = useState(null)
+  const sourceWidth = Number(imageSize?.width) || naturalSize?.width || 1
+  const sourceHeight = Number(imageSize?.height) || naturalSize?.height || 1
 
   useEffect(() => {
     const element = viewportRef.current
@@ -215,7 +216,15 @@ export default function SourceImagePane({
               className="block h-full w-full select-none object-fill"
               draggable="false"
               decoding="async"
-              onLoad={() => setImageReady(true)}
+              onLoad={(event) => {
+                setImageReady(true)
+                if (event.currentTarget.naturalWidth && event.currentTarget.naturalHeight) {
+                  setNaturalSize({
+                    width: event.currentTarget.naturalWidth,
+                    height: event.currentTarget.naturalHeight,
+                  })
+                }
+              }}
             />
             {imageReady && points.map((point, index) => (
               <FloorControlPointMarker

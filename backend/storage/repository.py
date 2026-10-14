@@ -691,6 +691,9 @@ class SessionRepository:
             point.updated_at = existing.updated_at
             self._save_control_points_atomic()
 
+    def update_control_point(self, point: ControlPoint) -> None:
+        self.save_control_point(point)
+
     def delete_control_point(self, control_point_id: UUID) -> None:
         with self._lock:
             point = self._control_point_by_id.pop(control_point_id, None)

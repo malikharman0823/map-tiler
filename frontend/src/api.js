@@ -521,6 +521,66 @@ export async function resetBackgroundRemoval(datasetId) {
   return response.data.data
 }
 
+export async function getRasterTransform(datasetId) {
+  const response = await client.get(
+    `/datasets/${encodeURIComponent(datasetId)}/transform`,
+  )
+  return response.data.data
+}
+
+export async function previewRasterTransform(datasetId, { corners, mode = "free", rotationAngle = null, lockAspectRatio = false } = {}) {
+  const response = await client.post(
+    `/datasets/${encodeURIComponent(datasetId)}/transform`,
+    {
+      action: "preview",
+      mode,
+      corners,
+      rotation_angle: rotationAngle,
+      lock_aspect_ratio: lockAspectRatio,
+    },
+  )
+  return response.data.data
+}
+
+export async function applyRasterTransform(datasetId, { corners, mode = "free", rotationAngle = null, lockAspectRatio = false, resampling = "bilinear" } = {}) {
+  const response = await client.post(
+    `/datasets/${encodeURIComponent(datasetId)}/transform`,
+    {
+      action: "apply",
+      mode,
+      corners,
+      rotation_angle: rotationAngle,
+      lock_aspect_ratio: lockAspectRatio,
+      resampling,
+    },
+  )
+  return response.data.data
+}
+
+export async function undoRasterTransform(datasetId) {
+  const response = await client.post(
+    `/datasets/${encodeURIComponent(datasetId)}/transform`,
+    { action: "undo" },
+  )
+  return response.data.data
+}
+
+export async function redoRasterTransform(datasetId) {
+  const response = await client.post(
+    `/datasets/${encodeURIComponent(datasetId)}/transform`,
+    { action: "redo" },
+  )
+  return response.data.data
+}
+
+export async function resetRasterTransform(datasetId) {
+  const response = await client.post(
+    `/datasets/${encodeURIComponent(datasetId)}/transform`,
+    { action: "reset" },
+  )
+  return response.data.data
+}
+
 export function readableApiError(error, fallbackMessage) {
   const apiError = error.response?.data?.error
   if (apiError) {

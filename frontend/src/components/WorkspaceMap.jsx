@@ -12,6 +12,7 @@ import {
   datasetTileUrl,
 } from "../api"
 import MapCoordinates from "./MapCoordinates"
+import RasterTransformOverlay from "./RasterTransformOverlay"
 
 
 setWorkerUrl(mapLibreWorkerUrl)
@@ -76,6 +77,7 @@ function setVisibility(map, layerIds, visible) {
   })
 }
 
+
 export default function WorkspaceMap({
   members = [],
   records = [],
@@ -83,12 +85,19 @@ export default function WorkspaceMap({
   onSelectRecord,
   onCameraChange,
   savedCamera,
+  transformMember,
+  onEndTransform,
+  onTransformApplied,
+  activeFloorLevel = 0,
+  onActiveFloorChange,
 }) {
   const containerRef = useRef(null)
   const mapRef = useRef(null)
   const membersRef = useRef(members)
   const selectRecordRef = useRef(onSelectRecord)
   const cameraChangeRef = useRef(onCameraChange)
+  const activeFloorLevelRef = useRef(activeFloorLevel)
+  const onActiveFloorChangeRef = useRef(onActiveFloorChange)
   const fittedRef = useRef(false)
   const [ready, setReady] = useState(false)
   const [coordinate, setCoordinate] = useState(null)
@@ -104,6 +113,14 @@ export default function WorkspaceMap({
   useEffect(() => {
     cameraChangeRef.current = onCameraChange
   }, [onCameraChange])
+
+  useEffect(() => {
+    activeFloorLevelRef.current = activeFloorLevel
+  }, [activeFloorLevel])
+
+  useEffect(() => {
+    onActiveFloorChangeRef.current = onActiveFloorChange
+  }, [onActiveFloorChange])
 
   useEffect(() => {
     if (!containerRef.current) return undefined
@@ -129,7 +146,9 @@ export default function WorkspaceMap({
       maxZoom: 22,
     })
     map.addControl(new NavigationControl({ showCompass: true }), "bottom-right")
-    map.on("load", () => setReady(true))
+    map.on("load", () => {
+      setReady(true)
+    })
     map.on("mousemove", (event) => {
       setCoordinate({ latitude: event.lngLat.lat, longitude: event.lngLat.lng })
     })
@@ -145,6 +164,7 @@ export default function WorkspaceMap({
         selectRecordRef.current?.(feature.properties.record_id)
       }
     })
+
     let cameraTimer
     map.on("moveend", () => {
       clearTimeout(cameraTimer)
@@ -160,9 +180,22 @@ export default function WorkspaceMap({
       }, 400)
     })
     mapRef.current = map
+    window.__maptiler_map = map
+    window.__maptiler_setLayerOpacity = (datasetId, opacityVal) => {
+      const activeMap = mapRef.current
+      if (!activeMap || !activeMap.isStyleLoaded()) return
+      const ids = resourceIds(datasetId)
+      if (activeMap.getLayer(ids.rasterLayer)) {
+        const safe = Number.isFinite(opacityVal) ? Math.max(0, Math.min(1, opacityVal)) : 1.0
+        activeMap.setPaintProperty(ids.rasterLayer, "raster-opacity", safe)
+      }
+    }
     return () => {
       clearTimeout(cameraTimer)
       mapRef.current = null
+      delete window.__maptiler_map
+      delete window.__maptiler_setFloor
+      delete window.__maptiler_setLayerOpacity
       map.remove()
     }
   }, [])
@@ -171,6 +204,21 @@ export default function WorkspaceMap({
     () => [...members].sort((a, b) => a.sort_order - b.sort_order),
     [members],
   )
+
+  const buildingFloors = useMemo(() => {
+    return sortedMembers
+      .filter((m) => m.is_building_floor || m.building_name)
+      .sort((a, b) => (b.floor_level ?? 0) - (a.floor_level ?? 0)) // Higher floors on top
+  }, [sortedMembers])
+
+  function handleElevatorClick(level) {
+    activeFloorLevelRef.current = level
+    if (onActiveFloorChange) onActiveFloorChange(level)
+  }
+
+  useEffect(() => {
+    window.__maptiler_setFloor = handleElevatorClick
+  })
 
   useEffect(() => {
     const map = mapRef.current
@@ -183,14 +231,39 @@ export default function WorkspaceMap({
       const layer = member.dataset.map_layer
       if (!layer) return
       activeSourceIds.add(ids.rasterSource)
-      const bgRemovalUpdate = member.dataset?.extracted_metadata?.background_removal?.updated_at || ""
+      activeLayerIds.add(ids.rasterLayer)
+      const bgRemovalUpdate = member.dataset?.metadata?.background_removal?.updated_at
+        || member.dataset?.extracted_metadata?.background_removal?.updated_at
+        || ""
+      const transformUpdate = member.dataset?.metadata?.raster_transform?.updated_at
+        || member.dataset?.extracted_metadata?.raster_transform?.updated_at
+        || ""
+      const updateVersion = [transformUpdate, bgRemovalUpdate].filter(Boolean).join("_")
       const baseTileUrl = datasetTileUrl(member.dataset_id, layer.tile_url_template)
-      const tileUrl = bgRemovalUpdate
-        ? `${baseTileUrl}${baseTileUrl.includes("?") ? "&" : "?"}v=${encodeURIComponent(bgRemovalUpdate)}`
+      const tileUrl = updateVersion
+        ? `${baseTileUrl}${baseTileUrl.includes("?") ? "&" : "?"}v=${encodeURIComponent(updateVersion)}`
         : baseTileUrl
+
+      const bounds = boundsArray(layer.bounds)
+      const boundsKey = bounds ? bounds.map((n) => Number(n).toFixed(6)).join(",") : ""
       const existing = map.getSource(ids.rasterSource)
-      if (existing?.setTiles) existing.setTiles([tileUrl])
-      if (!existing) {
+
+      if (existing) {
+        const urlChanged = existing._currentTileUrl && existing._currentTileUrl !== tileUrl
+        const boundsChanged = existing._currentBounds && existing._currentBounds !== boundsKey
+        if (urlChanged || boundsChanged) {
+          try {
+            if (map.getLayer(ids.rasterLayer)) {
+              map.removeLayer(ids.rasterLayer)
+            }
+            map.removeSource(ids.rasterSource)
+          } catch {
+            // ignore
+          }
+        }
+      }
+
+      if (!map.getSource(ids.rasterSource)) {
         const options = {
           type: "raster",
           tiles: [tileUrl],
@@ -198,20 +271,38 @@ export default function WorkspaceMap({
           minzoom: layer.tile_min_zoom ?? 0,
           maxzoom: layer.tile_max_zoom ?? 22,
         }
-        const bounds = boundsArray(layer.bounds)
         if (bounds) options.bounds = bounds
         map.addSource(ids.rasterSource, options)
+        const added = map.getSource(ids.rasterSource)
+        if (added) {
+          added._currentTileUrl = tileUrl
+          added._currentBounds = boundsKey
+        }
       }
+
+      const safeOpacity = typeof member.raster_opacity === "number" && Number.isFinite(member.raster_opacity)
+        ? Math.max(0, Math.min(1, member.raster_opacity))
+        : 1.0
+
       if (!map.getLayer(ids.rasterLayer)) {
+        const firstPointLayer = [ids.controlCircle, ids.controlLabel, ids.iconCircle, ids.iconLabel]
+          .find((layerId) => map.getLayer(layerId))
         map.addLayer({
           id: ids.rasterLayer,
           type: "raster",
           source: ids.rasterSource,
-          paint: { "raster-opacity": member.raster_opacity },
-        })
+          paint: { "raster-opacity": safeOpacity },
+        }, firstPointLayer)
       }
-      map.setPaintProperty(ids.rasterLayer, "raster-opacity", member.raster_opacity)
-      setVisibility(map, [ids.rasterLayer], member.visible && member.raster_visible)
+
+      // Check if this member is a floor of a building:
+      // If so, only show it if its floor level matches activeFloorLevel
+      const isBuildingFloor = Boolean(member.is_building_floor || member.building_name)
+      const isFloorActive = !isBuildingFloor || (member.floor_level === activeFloorLevel)
+      const isLayerVisible = member.visible && member.raster_visible && isFloorActive
+
+      map.setPaintProperty(ids.rasterLayer, "raster-opacity", safeOpacity)
+      setVisibility(map, [ids.rasterLayer], isLayerVisible)
     })
 
     sortedMembers.forEach((member) => {
@@ -336,7 +427,7 @@ export default function WorkspaceMap({
         fittedRef.current = true
       }
     }
-  }, [ready, records, selectedRecordId, sortedMembers])
+  }, [ready, records, selectedRecordId, sortedMembers, activeFloorLevel])
 
   useEffect(() => {
     const selected = records.find((record) => record.id === selectedRecordId)
@@ -358,6 +449,42 @@ export default function WorkspaceMap({
     <div className="workspace-map-canvas">
       <div ref={containerRef} className="workspace-map" />
       <MapCoordinates coordinate={coordinate} />
+
+      {buildingFloors.length > 1 && (
+        <div className="workspace-elevator-widget">
+          <div className="workspace-elevator-header">Floors</div>
+          <div className="workspace-elevator-buttons">
+            {buildingFloors.map((floor) => {
+              const level = floor.floor_level ?? 0
+              const isActive = activeFloorLevel === level
+              const badge = level === -1 ? "B1" : level === 0 ? "G" : `${level}`
+              const name = floor.floor_label || (level === -1 ? "Basement 1" : level === 0 ? "Ground Floor" : `Floor ${level}`)
+              return (
+                <button
+                  key={floor.dataset_id}
+                  type="button"
+                  className={`workspace-elevator-btn ${isActive ? "is-active" : ""}`}
+                  title={`${name} (Click to switch floor)`}
+                  onClick={() => handleElevatorClick(level)}
+                >
+                  <span className="workspace-elevator-badge">{badge}</span>
+                  <span>{name}</span>
+                </button>
+              )
+            })}
+          </div>
+        </div>
+      )}
+
+      {transformMember && mapRef.current && (
+        <RasterTransformOverlay
+          map={mapRef.current}
+          datasetId={transformMember.dataset_id}
+          datasetName={transformMember.name}
+          onClose={onEndTransform}
+          onApplied={onTransformApplied}
+        />
+      )}
       {!sortedMembers.some((member) => member.dataset.map_layer) && (
         <div className="workspace-map-empty">
           <strong>No mapped raster is available</strong>

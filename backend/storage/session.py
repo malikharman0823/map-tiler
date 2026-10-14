@@ -312,7 +312,17 @@ def cleanup_expired_sessions(
         all_ids.update(item.name for item in manager.root_dir.iterdir() if item.is_dir())
 
     for session_id in all_ids:
-        repo = manager.get_session(session_id, touch=False, allow_expired=True)
+        try:
+            repo = manager.get_session(session_id, touch=False, allow_expired=True)
+        except ApplicationError:
+            session_dir = manager.root_dir / session_id
+            if session_dir.exists() and session_dir.is_dir():
+                if remove_directory(session_dir):
+                    cleaned.append(session_id)
+                else:
+                    logger.warning("Could not remove orphan session %s", session_id)
+            continue
+
         if repo is None:
             session_dir = manager.root_dir / session_id
             if session_dir.exists():

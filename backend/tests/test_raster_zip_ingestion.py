@@ -95,41 +95,59 @@ class RasterZipIngestionTests(unittest.TestCase):
         self.assertEqual(dataset.extracted_metadata["georeference_source"], "sidecar")
         self.assertEqual(len(dataset.extracted_metadata["transform"]), 6)
 
-    def test_unsafe_and_ambiguous_archives_leave_no_dataset_or_files(self) -> None:
+    def test_unsafe_archives_leave_no_dataset_or_files(self) -> None:
         with self.assertRaises(ApplicationError) as unsafe:
             self._upload(
                 self._zip_bytes({"../floor.png": self.source.read_bytes()})
             )
         self.assertEqual(unsafe.exception.code, "UNSAFE_RASTER_ARCHIVE")
-
-        with self.assertRaises(ApplicationError) as ambiguous:
-            self._upload(
-                self._zip_bytes(
-                    {
-                        "floor-a.png": self.source.read_bytes(),
-                        "floor-b.png": self.source.read_bytes(),
-                    }
-                )
-            )
-        self.assertEqual(ambiguous.exception.code, "AMBIGUOUS_RASTER_BUNDLE")
         self.assertEqual(self.db.list_datasets(), [])
         self.assertFalse(self.uploads.exists())
+
+    def test_multiple_raster_bundles_import_all_datasets(self) -> None:
+        source_b = self.root / "floor_b.png"
+        with rasterio.open(
+            source_b,
+            "w",
+            driver="PNG",
+            width=5,
+            height=4,
+            count=3,
+            dtype="uint8",
+        ) as image:
+            image.write(numpy.full((3, 4, 5), 128, dtype="uint8"))
+
+        response = self._upload(
+            self._zip_bytes(
+                {
+                    "floor-a.png": self.source.read_bytes(),
+                    "floor-b.png": source_b.read_bytes(),
+                }
+            )
+        )
+        datasets = self.db.list_datasets()
+        self.assertEqual(len(datasets), 2)
+        filenames = {d.filename for d in datasets}
+        self.assertEqual(filenames, {"floor-a.png", "floor-b.png"})
+        self.assertIsNotNone(response.data.imported_datasets)
+        self.assertEqual(len(response.data.imported_datasets), 2)
 
     def test_non_zip_and_extra_files_are_rejected(self) -> None:
         with self.assertRaises(ApplicationError) as extension:
             self._upload(b"not a zip", "floor.png")
         self.assertEqual(extension.exception.code, "ZIP_REQUIRED")
 
-        with self.assertRaises(ApplicationError) as extra:
-            self._upload(
-                self._zip_bytes(
-                    {
-                        "floor.png": self.source.read_bytes(),
-                        "readme.txt": b"unexpected",
-                    }
-                )
+        # Unsupported or extra files (like readme.txt) do not prevent valid rasters from loading
+        response = self._upload(
+            self._zip_bytes(
+                {
+                    "floor.png": self.source.read_bytes(),
+                    "readme.txt": b"unexpected auxiliary documentation",
+                }
             )
-        self.assertEqual(extra.exception.code, "UNSUPPORTED_RASTER_BUNDLE_CONTENT")
+        )
+        self.assertIsNotNone(response.data)
+        self.assertEqual(response.data.filename, "floor.png")
 
 
 if __name__ == "__main__":

@@ -543,6 +543,20 @@ class SessionRepositoryComprehensiveTests(unittest.TestCase):
         finally:
             settings.max_storage_per_session_bytes = original_quota
 
+    # -------------------------------------------------------------------------
+    # Test 15: Cleanup handles malformed/orphaned session directories without crashing
+    # -------------------------------------------------------------------------
+    def test_cleanup_handles_malformed_directories(self) -> None:
+        malformed_dir = self.session_dir / "short_invalid"
+        malformed_dir.mkdir(parents=True, exist_ok=True)
+        (malformed_dir / "garbage.txt").write_text("orphan data", encoding="utf-8")
+        self.assertTrue(malformed_dir.is_dir())
+
+        cleaned = cleanup_expired_sessions(self.storage)
+        self.assertIn("short_invalid", cleaned)
+        self.assertFalse(malformed_dir.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
+

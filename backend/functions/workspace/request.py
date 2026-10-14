@@ -10,12 +10,16 @@ class WorkspaceMemberCreateRequest(BaseModel):
 
 class WorkspaceMemberUpdateRequest(BaseModel):
     alias: str | None = Field(default=None, max_length=255)
-    sort_order: int | None = Field(default=None, ge=0)
+    sort_order: int | None = Field(default=None)
     visible: bool | None = None
     raster_visible: bool | None = None
     control_points_visible: bool | None = None
     icon_points_visible: bool | None = None
     raster_opacity: float | None = Field(default=None, ge=0, le=1)
+    building_name: str | None = None
+    floor_level: int | None = None
+    floor_label: str | None = None
+    floor_role: str | None = None
 
 
 class WorkspaceCameraRequest(BaseModel):

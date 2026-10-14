@@ -283,15 +283,34 @@ def _read_tile(source, tile_bounds) -> numpy.ndarray:
         TILE_SIZE
     )
     
+    has_alpha_band = (
+        source.count == 4
+        or (
+            source.count == 2
+            and (
+                len(source.colorinterp) < 2
+                or source.colorinterp[1] in {ColorInterp.alpha, ColorInterp.undefined}
+            )
+        )
+        or (
+            source.count in {2, 4}
+            and len(source.colorinterp) >= source.count
+            and source.colorinterp[source.count - 1] == ColorInterp.alpha
+        )
+    )
+
     try:
-        with WarpedVRT(
-            source,
-            crs=source.crs,
-            transform=dst_transform,
-            width=TILE_SIZE,
-            height=TILE_SIZE,
-            resampling=Resampling.bilinear,
-        ) as vrt:
+        vrt_kwargs = {
+            "crs": source.crs,
+            "transform": dst_transform,
+            "width": TILE_SIZE,
+            "height": TILE_SIZE,
+            "resampling": Resampling.bilinear,
+        }
+        if not has_alpha_band:
+            vrt_kwargs["add_alpha"] = True
+
+        with WarpedVRT(source, **vrt_kwargs) as vrt:
             colors = vrt.read(
                 color_indexes,
                 masked=True,
@@ -303,22 +322,17 @@ def _read_tile(source, tile_bounds) -> numpy.ndarray:
                 red = green = blue = color_values[0]
             else:
                 red, green, blue = color_values
-        
-            alpha = numpy.where(valid_pixels, 255, 0).astype(numpy.uint8)
-            has_alpha_band = (
-                source.count in {2, 4}
-                and source.colorinterp[source.count - 1] == ColorInterp.alpha
+
+            alpha_band_idx = vrt.count if not has_alpha_band else source.count
+            source_alpha = vrt.read(
+                alpha_band_idx,
+                masked=True,
             )
-            if has_alpha_band:
-                source_alpha = vrt.read(
-                    source.count,
-                    masked=True,
-                )
-                alpha_values = _to_uint8(numpy.asarray(source_alpha.filled(0)))
-                alpha_mask = numpy.ma.getmaskarray(source_alpha)
-                alpha = numpy.where(valid_pixels & ~alpha_mask, alpha_values, 0).astype(
-                    numpy.uint8
-                )
+            alpha_values = _to_uint8(numpy.asarray(source_alpha.filled(0)))
+            alpha_mask = numpy.ma.getmaskarray(source_alpha)
+            alpha = numpy.where(valid_pixels & ~alpha_mask, alpha_values, 0).astype(
+                numpy.uint8
+            )
     except (RasterioError, OSError, TypeError, ValueError) as exc:
         raise _application_error(
             status_code=500,
@@ -439,6 +453,8 @@ def _response(
 def generate_tiles(
     request: TileGenerationRequest,
     db: SessionRepository,
+    *,
+    force: bool = False,
 ) -> TileGenerationResponse:
     dataset = _load_dataset(db, request.dataset_id)
     _validate_zoom_range(request.min_zoom, request.max_zoom)
@@ -449,7 +465,8 @@ def generate_tiles(
     with _open_processed_raster(source_path) as source:
         _require_web_mercator(source)
         if (
-            dataset.tile_status == "completed"
+            not force
+            and dataset.tile_status == "completed"
             and dataset.tile_path == relative_tile_path
             and dataset.tile_min_zoom == request.min_zoom
             and dataset.tile_max_zoom == request.max_zoom
@@ -481,6 +498,9 @@ def generate_tiles(
             effective_max_zoom = request.max_zoom
 
         try:
+            if force and final_directory.is_dir():
+                shutil.rmtree(final_directory, ignore_errors=True)
+                final_directory.mkdir(parents=True, exist_ok=True)
             _generate_tile_set(
                 source,
                 final_directory,

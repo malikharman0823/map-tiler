@@ -185,11 +185,18 @@ export default function DatasetPage() {
 
   const isMbtiles = datasetFormat === "mbtiles" || Boolean(dataset?.metadata?.mbtiles_path)
   const isVectorMbtiles = isMbtiles && ["pbf", "mvt"].includes(dataset?.metadata?.tile_format)
+  const bgRemovalUpdate = dataset?.metadata?.background_removal?.updated_at
+    || dataset?.extracted_metadata?.background_removal?.updated_at
+    || ""
   const tileUrl = useMemo(
-    () => isMbtiles
-      ? mbtilesTileUrl(id)
-      : datasetTileUrl(id, dataset?.map_layer?.tile_url_template),
-    [dataset?.map_layer?.tile_url_template, id, isMbtiles],
+    () => {
+      if (isMbtiles) return mbtilesTileUrl(id)
+      const base = datasetTileUrl(id, dataset?.map_layer?.tile_url_template)
+      return bgRemovalUpdate
+        ? `${base}${base.includes("?") ? "&" : "?"}v=${encodeURIComponent(bgRemovalUpdate)}`
+        : base
+    },
+    [dataset?.map_layer?.tile_url_template, id, isMbtiles, bgRemovalUpdate],
   )
 
   async function removeDataset() {

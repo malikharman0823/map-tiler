@@ -252,7 +252,23 @@ def _map_layer(dataset: Dataset, georeference) -> MapLayerSummary | None:
             field="dataset_id",
         )
 
-    output_path = georeference.output_path if georeference else dataset.processed_path
+    output_path = None
+    if dataset.processed_path:
+        try:
+            cand = _managed_path(
+                dataset.processed_path,
+                PROCESSED_DIRECTORY / str(dataset.id),
+                code="RASTER_OUTPUT_NOT_FOUND",
+                message="",
+                details="",
+            )
+            if cand.is_file():
+                output_path = dataset.processed_path
+        except ApplicationError:
+            pass
+
+    if not output_path:
+        output_path = georeference.output_path if georeference else dataset.processed_path
     if not output_path:
         return None
 
@@ -293,6 +309,19 @@ def _response(dataset: Dataset, georeference) -> DatasetDetailResponse:
     elif format_type == "mtmap":
         display_type = "project"
 
+    metadata = dict(dataset.extracted_metadata or {})
+    if (not metadata.get("width") or not metadata.get("height")) and dataset.storage_path:
+        cand = Path(dataset.storage_path)
+        cand_path = cand if cand.is_absolute() else (BACKEND_DIRECTORY / cand).resolve()
+        if cand_path.is_file():
+            try:
+                from PIL import Image
+                with Image.open(cand_path) as img:
+                    metadata["width"] = img.width
+                    metadata["height"] = img.height
+            except Exception:
+                pass
+
     return DatasetDetailResponse(
         data=DatasetDetailData(
             id=dataset.id,
@@ -301,7 +330,7 @@ def _response(dataset: Dataset, georeference) -> DatasetDetailResponse:
             content_type=dataset.content_type,
             file_hash=dataset.file_hash,
             storage_path=dataset.storage_path,
-            metadata=dataset.extracted_metadata,
+            metadata=metadata,
             georeferenced_path=dataset.georeferenced_path,
             georeference_status=dataset.georeference_status,
             processed_path=dataset.processed_path,

@@ -53,7 +53,34 @@ def _find_dataset_by_hash(
     return db.find_dataset_by_hash(file_hash)
 
 
-def _build_upload_response(dataset: Dataset, *, existing: bool) -> UploadResponse:
+def _build_upload_response(
+    dataset: Dataset,
+    *,
+    existing: bool,
+    message: str | None = None,
+    imported_datasets: list[Dataset] | None = None,
+) -> UploadResponse:
+    default_msg = (
+        "This file already exists."
+        if existing
+        else "File uploaded successfully."
+    )
+    imported_list = None
+    if imported_datasets:
+        imported_list = [
+            {
+                "id": str(d.id),
+                "filename": d.filename,
+                "is_georeferenced": bool(
+                    d.georeference_status == "completed"
+                    or (
+                        d.extracted_metadata.get("crs")
+                        and d.extracted_metadata.get("transform")
+                    )
+                ),
+            }
+            for d in imported_datasets
+        ]
     return UploadResponse(
         data=UploadData(
             id=dataset.id,
@@ -72,11 +99,8 @@ def _build_upload_response(dataset: Dataset, *, existing: bool) -> UploadRespons
                 )
             ),
             georeference_status=dataset.georeference_status,
-            message=(
-                "This file already exists."
-                if existing
-                else "File uploaded successfully."
-            ),
+            message=message or default_msg,
+            imported_datasets=imported_list,
         )
     )
 
